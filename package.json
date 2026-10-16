@@ -1,0 +1,65 @@
+{
+  "name": "@nickpaustian/theia",
+  "version": "0.1.0",
+  "description": "Cluster-hierarchy level of detail for three.js: a crack-free cut through a simplified mesh hierarchy chosen by screen-space error, streamed as the camera needs it",
+  "type": "module",
+  "license": "MIT",
+  "author": "Nicholas Paustian",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nickpaustian/theia.git"
+  },
+  "homepage": "https://github.com/nickpaustian/theia#readme",
+  "bugs": "https://github.com/nickpaustian/theia/issues",
+  "keywords": [
+    "three",
+    "lod",
+    "level-of-detail",
+    "nanite",
+    "meshlets",
+    "clusters",
+    "streaming",
+    "webgl2",
+    "meshoptimizer"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "dist",
+    "tools",
+    "README.md",
+    "LICENSE",
+    "docs"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc -p tsconfig.json",
+    "prepack": "npm run build"
+  },
+  "bin": {
+    "theia": "tools/cli.mjs"
+  },
+  "peerDependencies": {
+    "three": ">=0.159.0 <0.170.0"
+  },
+  "dependencies": {
+    "meshoptimizer": "^1.3.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.5.2",
+    "three": "^0.164.1",
+    "@types/three": "^0.164.1"
+  }
+}
