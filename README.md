@@ -132,6 +132,17 @@ theia preview out/dir [--port 4180] [--no-open] [--error 1.5] [--slots 4096]
 - `ranges` draw mode relies on private `BatchedMesh` fields and is slower on ANGLE's Metal backend, where multi-draw is a loop of draw calls. It is experimental.
 - The hierarchy format may change before 1.0; the manifest's `format` field guards it.
 
+## Development
+
+```
+npm ci
+npm test            # vitest: the page scheduler against an in-memory host, the builder and inspect on a generated sphere, the runtime loading and refining that build in Node
+npm run typecheck
+npm run build       # dist/
+```
+
+CI runs typecheck, tests and build against three r159, r164 and r169 on every push and pull request, and publishes to npm with provenance on a `v*` tag. Blender is not available in CI, so `theia normalise` is exercised by hand.
+
 ## Licence
 
 MIT.
