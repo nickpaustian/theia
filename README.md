@@ -139,9 +139,10 @@ npm ci
 npm test            # vitest: the page scheduler against an in-memory host, the builder and inspect on a generated sphere, the runtime loading and refining that build in Node
 npm run typecheck
 npm run build       # dist/
+npm run smoke       # headless Chromium through Playwright: the preview on a generated sphere, no failures, no cracks in a mixed cut, no holes on a camera whip
 ```
 
-CI runs typecheck, tests and build against three r159, r164 and r169 on every push and pull request, and publishes to npm with provenance on a `v*` tag. Blender is not available in CI, so `theia normalise` is exercised by hand.
+CI runs typecheck, tests and build against three r159, r164 and r169, and the smoke suite once in Chromium, on every push and pull request, and publishes to npm with provenance on a `v*` tag. Blender is not available in CI, so `theia normalise` is exercised by hand.
 
 ## Licence
 

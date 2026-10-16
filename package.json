@@ -47,7 +47,8 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc -p tsconfig.json",
     "prepack": "npm run build",
-    "test": "vitest run"
+    "test": "vitest run",
+    "smoke": "vitest run --config vitest.smoke.config.ts"
   },
   "bin": {
     "theia": "tools/cli.mjs"
@@ -60,6 +61,7 @@
   },
   "devDependencies": {
     "@types/three": "^0.164.1",
+    "playwright": "^1.64.1",
     "three": "^0.164.1",
     "typescript": "^5.5.2",
     "vitest": "^5.0.5"

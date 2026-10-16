@@ -101,6 +101,7 @@ const mesh = await ClusteredMesh.load("/asset", {
   material: new THREE.MeshStandardMaterial({ color: 0xcfc6b8, roughness: 0.8, metalness: 0 }),
 })
 window.theia = mesh
+window.theiaPreview = { renderer, scene, camera, controls, THREE }
 const sphere = mesh.geometry.boundingSphere
 mesh.position.copy(sphere.center).multiplyScalar(-1 / sphere.radius)
 mesh.scale.setScalar(1 / sphere.radius)
