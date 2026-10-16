@@ -159,6 +159,7 @@ export default class ClusteredMesh extends THREE.Mesh {
   public readonly occlusion: OcclusionPass
   public drawMode: DrawMode
   private ownsMaterial: boolean = false
+  private fetch: FetchLike
   private materialPatch: {
     material: THREE.Material
     onBeforeCompile: THREE.Material["onBeforeCompile"]
@@ -281,6 +282,7 @@ export default class ClusteredMesh extends THREE.Mesh {
       { ...options.scheduler, ...(options.pool ? { pool: options.pool } : {}), ...(options.fetch ? { fetch: options.fetch } : {}) }
     )
     this.ownsMaterial = !options.material
+    this.fetch = options.fetch ?? ((url, init) => fetch(url, init))
     this.patchMaterial(this.material as THREE.Material)
   }
 
@@ -317,7 +319,7 @@ export default class ClusteredMesh extends THREE.Mesh {
     await Promise.all(
       [...this.rootPages].map(async (page) => {
         const { url, offset, length } = this.rangeOf(page)
-        const response = await fetch(url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } })
+        const response = await this.fetch(url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } })
         let buffer = await response.arrayBuffer()
         if (response.status !== 206) buffer = buffer.slice(offset, offset + length)
         this.receive(page, buffer)
