@@ -521,10 +521,14 @@ export default class ClusteredMesh extends THREE.Mesh {
 
     // The last cut, drawn from the camera of a frame or two ago, is the occluder set; the
     // readback is collected when its fence signals so the frame never waits on the GPU
+    // three refreshes camera.matrixWorldInverse only inside render, so a camera moved since the
+    // last frame would be culled against the previous view; derive it here instead
+    camera.updateMatrixWorld()
+    const cameraInverse = new THREE.Matrix4().copy(camera.matrixWorld).invert()
     const useOcclusion = this.occlusionCull && this.drawnClusters > 0 && this.occlusion.hasDepth
     if (this.occlusionCull && this.drawnClusters > 0) {
       this.occlusion.collect(renderer)
-      const view = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).multiply(this.matrixWorld)
+      const view = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, cameraInverse).multiply(this.matrixWorld)
       const moved = !view.equals(this.occlusionView)
       if ((moved || this.frame % this.occlusionInterval === 0) && this.occlusion.render(renderer, camera, [this], this.matrixWorld)) {
         this.occlusionView.copy(view)
@@ -536,7 +540,7 @@ export default class ClusteredMesh extends THREE.Mesh {
     this.updateMatrixWorld()
     const toLocal = new THREE.Matrix4().copy(this.matrixWorld).invert()
     const local = camera.getWorldPosition(new THREE.Vector3()).applyMatrix4(toLocal)
-    const viewProjection = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, camera.matrixWorldInverse).multiply(this.matrixWorld)
+    const viewProjection = new THREE.Matrix4().multiplyMatrices(camera.projectionMatrix, cameraInverse).multiply(this.matrixWorld)
     // Frustum in the mesh's local space, so cluster spheres can be tested as stored
     const frustum = new THREE.Frustum().setFromProjectionMatrix(viewProjection)
     const sphere = new THREE.Sphere()
