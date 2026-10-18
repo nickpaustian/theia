@@ -762,7 +762,18 @@ pages.forEach((page, pageId) => {
 mkdirSync(outDir, { recursive: true })
 levelBuffers.forEach((chunks, level) => writeFileSync(join(outDir, `level-${level}.bin`), Buffer.concat(chunks)))
 const roots = rootPages.map((id) => ({ id, ...pageRanges[id] }))
-const rootSphere = mergeSpheres(current.map((c) => c.selfBounds))
+// The mesh's own sphere, from the vertex extents the grid was sized on: tight, and the same
+// whatever the roots turned out to be, so a rebuild frames alike. (The roots' merged
+// spheres were up to 40% looser and moved with the grouping.)
+const rootSphere = (() => {
+  const centre = [0, 1, 2].map((k) => (gridMin[k] + gridMax[k]) / 2)
+  let radius = 0
+  for (const page of pages) for (const c of page.clusters) for (let i = 0; i < c.vertices.length; i += FLOATS) {
+    const d = Math.hypot(c.vertices[i] - centre[0], c.vertices[i + 1] - centre[1], c.vertices[i + 2] - centre[2])
+    if (d > radius) radius = d
+  }
+  return [centre[0], centre[1], centre[2], radius]
+})()
 const manifest = {
   format: 3,
   name: mesh.name,

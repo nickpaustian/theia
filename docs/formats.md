@@ -57,7 +57,7 @@ A folder holding `manifest.json` and one binary file per level. Nothing is read 
 | `levels[]` | `{ file, byteLength }` per level, index = level number |
 | `roots[]` | `{ id, level, offset, length }` of each root page |
 | `maxPageVertices`, `maxPageIndices`, `maxPageClusters` | the largest page, which sizes every arena slot |
-| `bounds` | `[cx, cy, cz, radius]` of the whole mesh |
+| `bounds` | `[cx, cy, cz, radius]` of the whole mesh: the centre of the vertex extents and the farthest vertex from it (builds before format 3 merged the roots' spheres, which was looser and changed with the grouping) |
 
 ### Level files
 
