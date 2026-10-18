@@ -1,13 +1,18 @@
 #!/usr/bin/env node
 // Builds a Theia cluster hierarchy from a glTF binary with meshoptimizer.
 //
-//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--force]
+//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--force]
 //
 // Level 0 is the master mesh (optionally pre-simplified to --target-tris) cut into meshlets.
 // Each further level merges small groups of adjacent clusters, simplifies the group with its
 // boundary locked (so neighbouring groups still meet exactly), and cuts the result into new
 // meshlets. A group that cannot simplify is carried up whole into the next level, where it is
 // grouped again with more neighbours, so the hierarchy always closes to a handful of roots.
+// A mesh whose UV layout is broken into many small islands, as photogrammetry often is, stalls
+// instead: the simplifier will not collapse across a seam, so tiny islands stay rigid. With
+// --permissive a group that cannot simplify is tried again with its vertices joined by position,
+// so seams no longer exist for it, which closes the hierarchy at the price of texture stretched
+// over the seams it crossed.
 //
 // A group's member clusters form one PAGE, the unit of streaming: the clusters it produced
 // all share the group's error and bounds, so when any of them is too coarse the whole page
@@ -39,7 +44,7 @@ const fail = (message) => {
 }
 const [input, outDir] = positional
 if (!input || !outDir) {
-  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--force]")
+  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--force]")
 }
 if (!existsSync(input) || !statSync(input).isFile()) fail(`${input} is not a file`)
 if (existsSync(outDir) && readdirSync(outDir).length > 0) {
@@ -53,6 +58,7 @@ const baseGroupSize = Number(option("group", 4))
 const maxGroupSize = Number(option("max-group", 8))
 const targetTriangles = Number(option("target-tris", 0))
 const meshChoice = option("mesh", null)
+const permissive = args.includes("--permissive")
 const FLOATS = 8 // px py pz nx ny nz u v
 const STRIDE = FLOATS // strides are in floats for the JS bindings
 const NONE = 0xffffffff
@@ -124,6 +130,32 @@ const readGlb = (path) => {
 //=========================
 // Helpers
 //=========================
+
+// Each vertex's first vertex at the same position, for simplifying as though no UV or normal
+// seam split the surface: the indices then name one vertex per point, so every seam is gone.
+const positionRemap = (vertices) => {
+  const count = vertices.length / FLOATS
+  const words = new Uint32Array(vertices.buffer, vertices.byteOffset, vertices.length)
+  const remap = new Uint32Array(count)
+  let tableBits = 1
+  while (1 << tableBits < count * 2) tableBits++
+  const table = new Uint32Array(1 << tableBits) // vertex + 1, 0 = empty
+  const mask = (1 << tableBits) - 1
+  for (let v = 0; v < count; v++) {
+    const base = v * FLOATS
+    let h = 2166136261
+    for (let k = 0; k < 3; k++) h = Math.imul(h ^ words[base + k], 16777619)
+    let slot = (h >>> 0) & mask
+    while (true) {
+      const entry = table[slot]
+      if (entry === 0) { table[slot] = v + 1; remap[v] = v; break }
+      const w = (entry - 1) * FLOATS
+      if (vertices[w] === vertices[base] && vertices[w + 1] === vertices[base + 1] && vertices[w + 2] === vertices[base + 2]) { remap[v] = entry - 1; break }
+      slot = (slot + 1) & mask
+    }
+  }
+  return remap
+}
 
 // Welds exact duplicate vertices (all 8 floats) so per-cluster copies rejoin for simplification.
 // Typed arrays and an open-addressing hash throughout: a plain array of 8 floats per vertex
@@ -301,12 +333,14 @@ const clusterise = (vertices, indices) => {
 }
 
 // Greedy grouping of adjacent clusters, groupSize at a time, by welding the whole level
-const groupClusters = (clusters, groupSize) => {
+const groupClusters = (clusters, groupSize, byPosition = false) => {
   const total = clusters.reduce((n, c) => n + c.vertices.length / FLOATS, 0)
   const all = new Float32Array(total * FLOATS)
   let at = 0
   for (const c of clusters) { all.set(c.vertices, at * FLOATS); at += c.vertices.length / FLOATS }
-  const { remap } = weld(all, new Uint32Array(0))
+  // Neighbours share vertices; with byPosition, also across UV seams, which on a mesh of tiny UV
+  // islands is the only way most clusters have neighbours at all
+  const remap = byPosition ? positionRemap(all) : weld(all, new Uint32Array(0)).remap
   const owners = new Map()
   at = 0
   clusters.forEach((cluster, c) => {
@@ -383,11 +417,15 @@ console.log(`level 0: ${current.length} clusters`)
 
 const pages = [] // { level, clusters: [] }
 let groupSize = baseGroupSize
+// With --permissive, set once a level has carried up more than a quarter of its clusters: from
+// there every group simplifies across seams, as retrying only the groups that fail still stalls
+let acrossSeams = false
 
 for (let level = 1; level < 32 && current.length > 1; level++) {
-  const groups = groupClusters(current, groupSize)
+  const groups = groupClusters(current, groupSize, permissive)
   const next = []
   let simplifiedGroups = 0
+  let permissiveGroups = 0
   let carried = 0
 
   for (const group of groups) {
@@ -403,17 +441,31 @@ for (let level = 1; level < 32 && current.length > 1; level++) {
     const { vertices, indices } = weld(merged, mergedIndices)
 
     const target = Math.max(3, Math.floor(indices.length / 2 / 3) * 3)
-    const [simplified] = MeshoptSimplifier.simplifyWithAttributes(
-      indices, vertices, STRIDE, attributesOf(vertices), 5, attributeWeights, null, target, 1.0, ["LockBorder"]
-    )
+    const attributes = attributesOf(vertices)
+    let source = indices
+    let [simplified] = MeshoptSimplifier.simplifyWithAttributes(source, vertices, STRIDE, attributes, 5, attributeWeights, null, target, 1.0, ["LockBorder"])
+    if (permissive && (acrossSeams || simplified.length >= indices.length * 0.9)) {
+      // Collapsing across seams: one vertex per position, so each kept vertex brings the UV of
+      // whichever island it came from. meshoptimizer's own Permissive flag is not enough here, as
+      // it still locks vertices where three or more islands meet, which is most of them.
+      const remap = positionRemap(vertices)
+      const across = indices.map((i) => remap[i])
+      const [retried] = MeshoptSimplifier.simplifyWithAttributes(across, vertices, STRIDE, attributes, 5, attributeWeights, null, target, 1.0, ["LockBorder"])
+      if (retried.length < indices.length * 0.9) {
+        source = across
+        simplified = retried
+        permissiveGroups++
+      }
+    }
     // The attribute-aware result keeps UVs and normals honest, but its error folds attribute
     // terms in; a position-only pass to the same target gives the geometric error to store,
     // which is what screen-space selection should be judged by
-    const [, relativeError] = MeshoptSimplifier.simplify(indices, vertices, STRIDE, target, 1.0, ["LockBorder"])
+    const [, relativeError] = MeshoptSimplifier.simplify(source, vertices, STRIDE, target, 1.0, ["LockBorder"])
     // meshoptimizer reports error relative to the extent of the mesh it was given, the group
     const groupScale = MeshoptSimplifier.getScale(vertices, STRIDE)
 
-    if (simplified.length >= indices.length * 0.9) {
+    // Nothing left would orphan the group's page: no parent cluster would point down to it
+    if (simplified.length === 0 || simplified.length >= indices.length * 0.9) {
       // Carry the clusters up whole; a larger neighbourhood next level may free their borders
       for (const m of members) { m.level = level; next.push(m) }
       carried += members.length
@@ -440,7 +492,11 @@ for (let level = 1; level < 32 && current.length > 1; level++) {
   }
   refreshLevelNormals(next)
   const tris = next.reduce((n, c) => n + c.indices.length / 3, 0)
-  console.log(`level ${level}: ${next.length} clusters, ${tris} triangles, ${groups.length} groups of ${groupSize} (${simplifiedGroups} simplified, ${carried} clusters carried up)`)
+  console.log(`level ${level}: ${next.length} clusters, ${tris} triangles, ${groups.length} groups of ${groupSize} (${simplifiedGroups} simplified${permissive ? `, ${permissiveGroups} across seams` : ""}, ${carried} clusters carried up)`)
+  if (permissive && !acrossSeams && carried > current.length / 4) {
+    acrossSeams = true
+    console.log(`level ${level}: over a quarter carried up; every group simplifies across seams from here`)
+  }
   current = next
   // Once most of a level is being carried, the locked borders need bigger neighbourhoods
   if (carried > next.length / 2 && groupSize < maxGroupSize) groupSize *= 2
@@ -461,7 +517,7 @@ console.log(`${current.length} root clusters in ${rootPages.length} root pages`)
 // Write
 //=========================
 
-const levelCount = Math.max(...pages.map((p) => p.level)) + 1
+const levelCount = pages.reduce((n, p) => Math.max(n, p.level), 0) + 1
 const levelBuffers = Array.from({ length: levelCount }, () => [])
 const levelBytes = new Array(levelCount).fill(0)
 

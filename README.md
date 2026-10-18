@@ -68,7 +68,7 @@ Occlusion culling holds rather than hides. The depth grid is read back a frame o
 ## Building a hierarchy
 
 ```
-theia build source.glb out/dir [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--force]
+theia build source.glb out/dir [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--force]
 ```
 
 The input is a glTF binary holding the mesh as one indexed primitive with positions and a UV set and no compression extensions; anything else is refused with a message and a non-zero exit. A file with several meshes needs `--mesh` to pick one (the refusal lists them). Normals are used when present and computed from the faces otherwise. The output folder must be empty unless `--force` is given, which replaces its contents, so a rebuild never leaves stale level files behind. `--target-tris` pre-simplifies the input with meshoptimizer, which copes with a few million triangles; above that, decimate in a DCC tool first. Expect to raise Node's heap for large inputs (`node --max-old-space-size=24000` handled 29 million triangles in about two and a half minutes). The output folder holds `manifest.json` and one binary file per level; serve it as static files from a host that honours HTTP `Range` requests and does not compress the binaries. The layout is written down in [formats.md](docs/formats.md).
@@ -81,9 +81,12 @@ The input is a glTF binary holding the mesh as one indexed primitive with positi
 | `--max-group` | 8 | ceiling on the group size as it grows at coarse levels. The largest group sets `maxPageVertices` and with it every arena slot |
 | `--target-tris` | none | pre-simplify the input to this many triangles before clustering |
 | `--mesh` | the only one | which mesh to build when the file has several, by name or index |
+| `--permissive` | off | for UV layouts broken into many small islands (photogrammetry): group clusters by position, and once a level carries up more than a quarter of its clusters, simplify every later group across UV seams. Closes the hierarchy at the price of texture stretched across the seams those levels crossed |
 | `--force` | off | replace the contents of a non-empty output folder |
 
 The build ends with a table of pages, clusters, triangles and bytes per level. Two details worth knowing: after each level is simplified every vertex normal is recomputed from the level's own faces, area weighted and shared across UV seams and cluster copies, because normals carried through the simplifier as attributes end up pointing away from the faces they sit on and show as dark wedges. Level 0 keeps the source normals unless `--target-tris` pre-simplified it. And the manifest carries a `build` token that the runtime appends to the binary file URLs: the files are byte-range fetched, so a rebuilt hierarchy served from a cache of the old one would arrive short. The manifest itself is fetched with `cache: "no-cache"`.
+
+The simplifier never collapses across a UV seam, so a mesh whose UV layout is thousands of tiny islands, as photogrammetry exports often are, stalls: each island stays nearly rigid, clusters on either side of a seam never count as neighbours, and the levels stop shrinking at the islands' outlines, leaving a coarsest level of millions of triangles. `--permissive` trades texture accuracy at the coarse levels for a hierarchy that closes. The level where it starts crossing seams is printed; levels below it keep their UVs exact. A Smithsonian scan of 10 million triangles in 116 thousand islands stalled at 2.3 million triangles without it and closed to under 3 thousand with it, crossing seams from level 9. The better fix is a new UV layout of large charts, baked from the old texture, before building.
 
 For sources that arrive in an unhelpful frame (an FBX at a thousandth of the intended size, rotated, or far from the origin), `theia normalise` runs Blender headless to bake the importer's transform into the vertices, optionally rescale, and move the origin, writing a glTF binary ready for `theia build`:
 
