@@ -708,7 +708,7 @@ const pageRanges = pages.map((page, pageId) => {
   return range
 })
 const clusterIds = new Map()
-let maxPageVertices = 0, maxPageIndices = 0, maxPageClusters = 0
+let maxPageVertices = 0, maxPageIndices = 0, maxPageClusters = 0, maxClusterVertices = 0
 const writeRecord = (words, floats, o, c, pageId, indexOffset, vertexOffset) => {
   words[o] = c.level
   words[o + 1] = pageId
@@ -746,6 +746,7 @@ pages.forEach((page, pageId) => {
   let v = 0, i = 0
   page.clusters.forEach((c, n) => {
     writeRecord(words, floats, HEADER_WORDS + n * RECORD_WORDS, c, pageId, i, v)
+    maxClusterVertices = Math.max(maxClusterVertices, c.vertices.length / FLOATS)
     v += c.vertices.length / FLOATS
     i += c.indices.length
   })
@@ -779,6 +780,8 @@ const manifest = {
   maxPageVertices,
   maxPageIndices,
   maxPageClusters,
+  // The largest cluster: an arena that gives each cluster a block of this many vertices wastes nothing at the finest level
+  maxClusterVertices,
   bounds: rootSphere.map((n) => +n.toFixed(6)),
   triangles: mesh.indices.length / 3,
 }

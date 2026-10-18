@@ -16,6 +16,7 @@ As format 2, with `format` 3 and:
 | --- | --- |
 | `floatsPerVertex` | 8, the *decoded* vertex layout |
 | `vertexBytes` | 20, bytes per packed vertex before the codec |
+| `maxClusterVertices` | the largest cluster's vertex count (64 with the default `--max-verts`); a runtime that gives every cluster its own block of this size holds pages without waste at the finest level |
 | `quantisation` | `{ origin: [x, y, z], step, positionBits }`: a position is `origin + q × step` for an integer `q` of `positionBits` bits. One grid for the whole hierarchy, so a vertex shared by two pages or two levels quantises to the same point and the cut stays crack-free. `theia build --position-bits` sets the bits (default 20: a step under a micron on a metre-sized object) |
 
 ### Level files

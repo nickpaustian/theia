@@ -32,6 +32,8 @@ export interface ClusterManifest {
   levels: { file: string; byteLength: number }[]
   maxPageVertices: number
   maxPageIndices: number
+  // Format 3: the largest cluster's vertex count
+  maxClusterVertices?: number
   bounds: [number, number, number, number]
   triangles: number
 }

@@ -29,6 +29,8 @@ describe("theia build", () => {
     const manifest = JSON.parse(readFileSync(join(out, "manifest.json"), "utf8"))
     expect(manifest.format).toBe(3)
     expect(manifest.quantisation.positionBits).toBe(20)
+    expect(manifest.maxClusterVertices).toBeGreaterThan(0)
+    expect(manifest.maxClusterVertices).toBeLessThanOrEqual(64)
     expect(manifest.triangles).toBe(mesh.indices.length / 3)
     expect(manifest.levels.length).toBeGreaterThan(3)
     expect(manifest.roots.length).toBeGreaterThan(0)

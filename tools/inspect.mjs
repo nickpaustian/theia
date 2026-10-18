@@ -82,6 +82,7 @@ while (queue.length > 0) {
     if (recordPage !== id) issue(`${where} says page ${recordPage}`)
     if (indexOffset + indexLength > indexCount) issue(`${where} index range ${indexOffset}+${indexLength} exceeds ${indexCount}`)
     if (vertexOffset + vertexLength > vertexCount) issue(`${where} vertex range ${vertexOffset}+${vertexLength} exceeds ${vertexCount}`)
+    if (manifest.maxClusterVertices !== undefined && vertexLength > manifest.maxClusterVertices) issue(`${where} has ${vertexLength} vertices, manifest maxClusterVertices is ${manifest.maxClusterVertices}`)
     if (!(selfError >= 0) || !(parentError >= selfError)) issue(`${where} errors not monotone: self ${selfError}, parent ${parentError}`)
     if (clusterIds.has(clusterId)) issue(`${where} repeats cluster id ${clusterId}`)
     clusterIds.add(clusterId)
