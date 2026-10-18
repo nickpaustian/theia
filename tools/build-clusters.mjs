@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Builds a Theia cluster hierarchy from a glTF binary with meshoptimizer.
 //
-//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--force]
+//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--position-bits 20] [--force]
 //
 // Level 0 is the master mesh (optionally pre-simplified to --target-tris) cut into meshlets.
 // Each further level merges small groups of adjacent clusters, simplifies the group with its
@@ -18,19 +18,24 @@
 // all share the group's error and bounds, so when any of them is too coarse the whole page
 // beneath is what the renderer needs. Pages are byte ranges inside per-level files.
 //
-// Output (format 2):
-//   manifest.json  counts, level files, root pages with byte ranges, arena sizing
-//   level-<n>.bin  pages back to back, each self-describing: a 4-word header (page id, cluster,
-//                  vertex and index counts), one 32-word record per cluster (see writeRecord:
-//                  level, page, child page id, index/vertex offsets and counts, self error and
-//                  bounds, parent error and bounds, normal cone, the child page's level/offset/
-//                  length, UV centroid, cluster id), vertices (8 floats each, duplicated per
-//                  cluster), then uint32 indices local to the page. Nothing is tabled up front.
+// Output (format 3):
+//   manifest.json  counts, level files, root pages with byte ranges, arena sizing, and the
+//                  position grid the vertices are quantised on
+//   level-<n>.bin  pages back to back, each self-describing: a 6-word header (page id, cluster,
+//                  vertex and index counts, encoded vertex and index bytes), one 32-word record
+//                  per cluster (see writeRecord: level, page, child page id, index/vertex offsets
+//                  and counts, self error and bounds, parent error and bounds, normal cone, the
+//                  child page's level/offset/length, UV centroid, cluster id), then the vertices
+//                  (20 bytes each before the codec: position on the grid as three u32, normal as
+//                  two octahedral snorm16, UV as two unorm16; duplicated per cluster) and the
+//                  uint16 indices local to the page, each block packed by meshoptimizer's codec
+//                  and padded to a word. Nothing is tabled up front; see docs/formats.md.
 
 import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, rmSync, statSync } from "node:fs"
 import { join, basename } from "node:path"
 import { MeshoptClusterizer } from "meshoptimizer/clusterizer"
 import { MeshoptSimplifier } from "meshoptimizer/simplifier"
+import { codecReady, encodeBlocks, quantisationFor, VERTEX_BYTES, headerWords } from "./page.mjs"
 
 const args = process.argv.slice(2)
 const positional = args.filter((a) => !a.startsWith("--"))
@@ -44,7 +49,7 @@ const fail = (message) => {
 }
 const [input, outDir] = positional
 if (!input || !outDir) {
-  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--force]")
+  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--position-bits 20] [--force]")
 }
 if (!existsSync(input) || !statSync(input).isFile()) fail(`${input} is not a file`)
 if (existsSync(outDir) && readdirSync(outDir).length > 0) {
@@ -63,6 +68,10 @@ const permissive = args.includes("--permissive")
 const partition = args.includes("--partition")
 // meshoptimizer's Regularize: more even triangle sizes and shapes as groups simplify, at a small cost in error
 const simplifyFlags = args.includes("--regularize") ? ["LockBorder", "Regularize"] : ["LockBorder"]
+// Bits per axis of the position grid; 20 puts a step under a micron on a metre-sized object
+const positionBits = Number(option("position-bits", 20))
+if (!(positionBits >= 8 && positionBits <= 32)) fail("--position-bits must be between 8 and 32")
+await codecReady()
 const FLOATS = 8 // px py pz nx ny nz u v
 const STRIDE = FLOATS // strides are in floats for the JS bindings
 const NONE = 0xffffffff
@@ -666,11 +675,32 @@ const levelBytes = new Array(levelCount).fill(0)
 // page beneath it, so nothing is needed up front but the manifest), then vertices and indices.
 // A cluster's children were paged before it, so their ranges are known by the time it is written.
 const RECORD_WORDS = 32
-const HEADER_WORDS = 4
+const HEADER_WORDS = headerWords(3)
+// Every vertex of every level quantises on one grid over the whole hierarchy, so shared
+// vertices land on the same point whichever page carries them
+const gridMin = [Infinity, Infinity, Infinity], gridMax = [-Infinity, -Infinity, -Infinity]
+for (const page of pages) for (const c of page.clusters) for (let i = 0; i < c.vertices.length; i += FLOATS) for (let k = 0; k < 3; k++) {
+  const value = c.vertices[i + k]
+  if (value < gridMin[k]) gridMin[k] = value
+  if (value > gridMax[k]) gridMax[k] = value
+}
+const quantisation = quantisationFor(gridMin, gridMax, positionBits)
+let uvClamped = 0
 const pageSizes = pages.map((page) => {
   let vertexCount = 0, indexCount = 0
   for (const c of page.clusters) { vertexCount += c.vertices.length / FLOATS; indexCount += c.indices.length }
-  return { vertexCount, indexCount, byteLength: (HEADER_WORDS + page.clusters.length * RECORD_WORDS + vertexCount * FLOATS + indexCount) * 4 }
+  const vertices = new Float32Array(vertexCount * FLOATS)
+  const indices = new Uint32Array(indexCount)
+  let v = 0, i = 0
+  for (const c of page.clusters) {
+    vertices.set(c.vertices, v * FLOATS)
+    for (let k = 0; k < c.indices.length; k++) indices[i + k] = c.indices[k] + v
+    v += c.vertices.length / FLOATS
+    i += c.indices.length
+  }
+  const blocks = encodeBlocks(vertices, indices, quantisation)
+  uvClamped += blocks.uvClamped
+  return { vertexCount, indexCount, blocks, byteLength: (HEADER_WORDS + page.clusters.length * RECORD_WORDS) * 4 + blocks.byteLength }
 })
 const pageRanges = pages.map((page, pageId) => {
   const range = { level: page.level, offset: levelBytes[page.level], length: pageSizes[pageId].byteLength }
@@ -707,20 +737,21 @@ const writeRecord = (words, floats, o, c, pageId, indexOffset, vertexOffset) => 
   words[o + 29] = clusterIds.get(c)
 }
 pages.forEach((page, pageId) => {
-  const { vertexCount, indexCount, byteLength } = pageSizes[pageId]
+  const { vertexCount, indexCount, blocks, byteLength } = pageSizes[pageId]
   const words = new Uint32Array(byteLength / 4)
   const floats = new Float32Array(words.buffer)
+  const bytes = new Uint8Array(words.buffer)
   words[0] = pageId; words[1] = page.clusters.length; words[2] = vertexCount; words[3] = indexCount
-  const vertexBase = HEADER_WORDS + page.clusters.length * RECORD_WORDS
-  const indexBase = vertexBase + vertexCount * FLOATS
+  words[4] = blocks.vertexBlock.byteLength; words[5] = blocks.indexBlock.byteLength
   let v = 0, i = 0
   page.clusters.forEach((c, n) => {
     writeRecord(words, floats, HEADER_WORDS + n * RECORD_WORDS, c, pageId, i, v)
-    floats.set(c.vertices, vertexBase + v * FLOATS)
-    for (let k = 0; k < c.indices.length; k++) words[indexBase + i + k] = c.indices[k] + v
     v += c.vertices.length / FLOATS
     i += c.indices.length
   })
+  const vertexStart = (HEADER_WORDS + page.clusters.length * RECORD_WORDS) * 4
+  bytes.set(blocks.vertexBlock, vertexStart)
+  bytes.set(blocks.indexBlock, vertexStart + ((blocks.vertexBlock.byteLength + 3) & ~3))
   levelBuffers[page.level].push(Buffer.from(words.buffer))
   maxPageVertices = Math.max(maxPageVertices, vertexCount)
   maxPageIndices = Math.max(maxPageIndices, indexCount)
@@ -732,12 +763,15 @@ levelBuffers.forEach((chunks, level) => writeFileSync(join(outDir, `level-${leve
 const roots = rootPages.map((id) => ({ id, ...pageRanges[id] }))
 const rootSphere = mergeSpheres(current.map((c) => c.selfBounds))
 const manifest = {
-  format: 2,
+  format: 3,
   name: mesh.name,
   // Cache-buster for the binary files, which are byte-range fetched and change size per build
   build: Date.now().toString(36),
+  // The decoded layout: 8 floats a vertex, as format 2 stored them
   floatsPerVertex: FLOATS,
   recordWords: RECORD_WORDS,
+  vertexBytes: VERTEX_BYTES,
+  quantisation,
   clusterCount: clusterIds.size,
   pageCount: pages.length,
   levels: levelBuffers.map((_, level) => ({ file: `level-${level}.bin`, byteLength: levelBytes[level] })),
@@ -758,4 +792,5 @@ const summary = levelBytes.map((bytes, level) => {
   return { level, pages: levelPages.length, clusters, triangles, MB: +(bytes / 1048576).toFixed(2) }
 })
 console.table(summary)
+if (uvClamped > 0) console.warn(`${uvClamped} vertex UVs fell outside [0, 1] and were clamped; format 3 stores UVs in that range`)
 console.log(`${clusterIds.size} clusters in ${pages.length} pages over ${levelCount} levels, ${(total / 1048576).toFixed(1)} MB in level files of which ${(records / 1048576).toFixed(1)} MB are records; up front: manifest with ${roots.length} root page${roots.length === 1 ? "" : "s"} -> ${outDir}`)

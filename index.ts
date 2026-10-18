@@ -1,6 +1,8 @@
 export { default as ClusteredMesh } from "./ClusteredMesh.js"
 export type { ClusterManifest, ClusteredMeshOptions, ClusteredMeshStats, DebugColour, DrawMode, CullMode } from "./ClusteredMesh.js"
 export { default as PageScheduler } from "./PageScheduler.js"
+export { decodePage, codecReady, FORMATS } from "./pageCodec.js"
+export type { DecodedPage, Quantisation } from "./pageCodec.js"
 export { default as OcclusionPass } from "./OcclusionPass.js"
 export type { OcclusionPassOptions } from "./OcclusionPass.js"
 export type { PageSchedulerOptions, PageSchedulerStats, PageRange, FetchLike } from "./PageScheduler.js"

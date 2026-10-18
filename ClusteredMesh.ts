@@ -3,6 +3,7 @@ import type { PoolClient } from "./pool.js"
 import type { FetchLike } from "./PageScheduler.js"
 import PageScheduler, { type PageSchedulerOptions, type PageSchedulerStats } from "./PageScheduler.js"
 import OcclusionPass, { type OcclusionPassOptions } from "./OcclusionPass.js"
+import { codecReady, decodePage, FORMATS, type Quantisation } from "./pageCodec.js"
 
 export interface PageRange {
   level: number
@@ -21,7 +22,11 @@ export interface ClusterManifest {
   // page above it
   roots: Array<PageRange & { id: number }>
   maxPageClusters: number
+  // The decoded vertex: 8 floats, px py pz nx ny nz u v
   floatsPerVertex: number
+  // Format 3: bytes per packed vertex and the position grid (see docs/formats.md)
+  vertexBytes?: number
+  quantisation?: Quantisation
   clusterCount: number
   pageCount: number
   levels: { file: string; byteLength: number }[]
@@ -107,10 +112,8 @@ export interface ClusteredMeshStats {
 
 const FLOATS = 8
 const NONE = 0xffffffff
-const FORMAT = 2
-// A page: header, one record per cluster, vertices, indices. Layouts in 32-bit words
-const HEADER_WORDS = 4
-const H_PAGE = 0, H_CLUSTER_COUNT = 1, H_VERTEX_COUNT = 2, H_INDEX_COUNT = 3
+// A page: header, one record per cluster, vertices, indices (decoded by pageCodec). Record
+// layout in 32-bit words
 const RECORD_WORDS = 32
 const C_LEVEL = 0, C_CHILD_PAGE = 2, C_INDEX_OFFSET = 3, C_INDEX_COUNT = 4, C_VERTEX_OFFSET = 5, C_VERTEX_COUNT = 6
 // words 12..16 hold the parent error and bounds; the traversal never needs them because a
@@ -295,9 +298,11 @@ export default class ClusteredMesh extends THREE.Mesh {
       return response
     }
     const manifest = (await (await get("manifest.json", { cache: "no-cache" })).json()) as ClusterManifest
-    if (manifest.format !== FORMAT || manifest.recordWords !== RECORD_WORDS) {
-      throw new Error(`Theia: ${base} is format ${manifest.format}; this build reads ${FORMAT}. Rebuild it with "theia build"`)
+    if (!FORMATS.includes(manifest.format) || manifest.recordWords !== RECORD_WORDS) {
+      throw new Error(`Theia: ${base} is format ${manifest.format}; this build reads ${FORMATS.join(" and ")}. Rebuild it with "theia build"`)
     }
+    if (manifest.format === 3 && !manifest.quantisation) throw new Error(`Theia: ${base} is format 3 but its manifest has no quantisation`)
+    await codecReady(manifest.format)
     const mesh = new ClusteredMesh(base, manifest, options)
     await mesh.loadRoots()
     return mesh
@@ -339,14 +344,11 @@ export default class ClusteredMesh extends THREE.Mesh {
     if (buffer.byteLength < expected) {
       throw new Error(`Theia: page ${page} arrived short (${buffer.byteLength} of ${expected} bytes); a cached file from an older build?`)
     }
-    const words = new Uint32Array(buffer, 0, buffer.byteLength / 4)
-    if (words[H_PAGE] !== page) throw new Error(`Theia: page ${page} payload is headed ${words[H_PAGE]}`)
-    const clusterCount = words[H_CLUSTER_COUNT]
-    const vertexCount = words[H_VERTEX_COUNT]
-    const indexCount = words[H_INDEX_COUNT]
-    const recordWords = clusterCount * RECORD_WORDS
+    const decoded = decodePage(buffer, this.manifest)
+    if (decoded.page !== page) throw new Error(`Theia: page ${page} payload is headed ${decoded.page}`)
+    const { clusterCount, vertices, indices } = decoded
     const recordBase = slot * this.slotClusters * RECORD_WORDS
-    this.slotRecords.set(words.subarray(HEADER_WORDS, HEADER_WORDS + recordWords), recordBase)
+    this.slotRecords.set(decoded.records, recordBase)
     this.slotClusterCount[slot] = clusterCount
     for (let c = 0; c < clusterCount; c++) {
       const w = recordBase + c * RECORD_WORDS
@@ -359,9 +361,6 @@ export default class ClusteredMesh extends THREE.Mesh {
         })
       }
     }
-    const vertexWord = HEADER_WORDS + recordWords
-    const vertices = new Float32Array(buffer, vertexWord * 4, vertexCount * FLOATS)
-    const indices = words.subarray(vertexWord + vertexCount * FLOATS, vertexWord + vertexCount * FLOATS + indexCount)
     this.writeVertices(slot, vertices)
     this.writeIndices(slot, indices)
     this.pageSlot[page] = slot

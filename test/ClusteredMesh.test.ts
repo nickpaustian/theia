@@ -96,7 +96,7 @@ describe("ClusteredMesh", () => {
   })
 
   it("refuses a manifest of another format", async () => {
-    const badFetch = async () => new Response(JSON.stringify({ format: 3, recordWords: 32 }), { status: 200 })
-    await expect(ClusteredMesh.load("/x", { fetch: badFetch })).rejects.toThrow(/format 3/)
+    const badFetch = async () => new Response(JSON.stringify({ format: 4, recordWords: 32 }), { status: 200 })
+    await expect(ClusteredMesh.load("/x", { fetch: badFetch })).rejects.toThrow(/format 4/)
   })
 })

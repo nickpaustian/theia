@@ -4,6 +4,41 @@ The layouts the build tools write and the runtimes read. The hierarchy carries a
 
 All multi-byte values are little-endian. "Word" means a 32-bit unsigned integer unless marked `f32`.
 
+## Format 3
+
+Format 2 with the geometry packed: each vertex is quantised to 20 bytes and the vertices and indices of a page go through [meshoptimizer](https://github.com/zeux/meshoptimizer)'s vertex and index codecs. On scans this is three to four times smaller than format 2 (a 10 KB page becomes 2.5 to 3 KB), and the records, unchanged, become about a fifth of a page. Everything else (manifest, roots, records, byte ranges) is as in format 2; the runtimes read both.
+
+### manifest.json
+
+As format 2, with `format` 3 and:
+
+| field | meaning |
+| --- | --- |
+| `floatsPerVertex` | 8, the *decoded* vertex layout |
+| `vertexBytes` | 20, bytes per packed vertex before the codec |
+| `quantisation` | `{ origin: [x, y, z], step, positionBits }`: a position is `origin + q × step` for an integer `q` of `positionBits` bits. One grid for the whole hierarchy, so a vertex shared by two pages or two levels quantises to the same point and the cut stays crack-free. `theia build --position-bits` sets the bits (default 20: a step under a micron on a metre-sized object) |
+
+### Level files
+
+| part | size | content |
+| --- | --- | --- |
+| header | 6 words | page id, cluster count `C`, vertex count `V`, index count `I`, encoded vertex bytes `VB`, encoded index bytes `IB` |
+| records | `C` × 32 words | as format 2 |
+| vertices | `VB` bytes, padded to a word | `V` packed vertices through `meshopt_encodeVertexBuffer` with a 20-byte stride |
+| indices | `IB` bytes, padded to a word | `I` uint16 indices through `meshopt_encodeIndexBuffer` (the codec may rotate a triangle's vertices; winding is kept) |
+
+A page's byte length is `(6 + 32C) × 4 + pad4(VB) + pad4(IB)`.
+
+### Packed vertex (20 bytes)
+
+| bytes | type | meaning |
+| --- | --- | --- |
+| 0–11 | 3 × u32 | position on the grid: `q` per axis |
+| 12–15 | 2 × i16 | normal, octahedral: `(u, v)` in snorm16, the lower hemisphere folded over the upper one's edge; decode `z = 1 − |u| − |v|`, if `z < 0` then `(u, v) ← ((1 − |v|)·sign u, (1 − |u|)·sign v)`, then normalise. Zero takes the positive sign |
+| 16–19 | 2 × u16 | UV in unorm16; UVs are clamped to [0, 1] at build (the build warns how many were) |
+
+A decoded vertex is within half a grid step of the source position, within about 0.01° in normal and within 1/131070 in UV.
+
 ## Format 2
 
 A folder holding `manifest.json` and one binary file per level. Nothing is read up front but the manifest; everything else is reached by following byte ranges from the root pages.

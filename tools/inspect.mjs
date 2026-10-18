@@ -7,6 +7,7 @@
 
 import { readFileSync, existsSync, statSync } from "node:fs"
 import { join } from "node:path"
+import { codecReady, decodePage, FORMATS } from "./page.mjs"
 
 const argv = process.argv.slice(2)
 const [dir] = argv.filter((a) => !a.startsWith("--"))
@@ -19,7 +20,6 @@ if (!dir) fail("usage: theia inspect <dir> [--no-scan]")
 if (!existsSync(join(dir, "manifest.json"))) fail(`${dir} has no manifest.json`)
 
 const FLOATS = 8
-const HEADER_WORDS = 4
 const RECORD_WORDS = 32
 const NONE = 0xffffffff
 const issues = []
@@ -29,8 +29,10 @@ const issue = (message) => {
 }
 
 const manifest = JSON.parse(readFileSync(join(dir, "manifest.json"), "utf8"))
-if (manifest.format !== 2) fail(`manifest format ${manifest.format}; this tool reads format 2`)
+if (!FORMATS.includes(manifest.format)) fail(`manifest format ${manifest.format}; this tool reads formats ${FORMATS.join(" and ")}`)
 if (manifest.recordWords !== RECORD_WORDS) fail(`manifest recordWords ${manifest.recordWords}; expected ${RECORD_WORDS}`)
+if (manifest.format === 3 && !manifest.quantisation) fail("format 3 manifest has no quantisation")
+await codecReady()
 
 const levels = manifest.levels.map((level, i) => {
   const path = join(dir, level.file)
@@ -54,12 +56,11 @@ while (queue.length > 0) {
   if (!file) { issue(`page ${id} is on level ${level}, which has no file`); continue }
   if (offset + length > file.data.length) { issue(`page ${id} range ${offset}+${length} runs past level ${level} (${file.data.length} bytes)`); continue }
   if (level >= parentLevel) issue(`page ${id} on level ${level} is reached from level ${parentLevel}; children must be finer`)
-  const words = new Uint32Array(file.data.buffer, file.data.byteOffset + offset, length / 4)
-  const floats = new Float32Array(words.buffer, words.byteOffset, words.length)
-  const [headerId, clusterCount, vertexCount, indexCount] = words
-  if (headerId !== id) issue(`page ${id} is headed ${headerId}`)
-  const expected = (HEADER_WORDS + clusterCount * RECORD_WORDS + vertexCount * FLOATS + indexCount) * 4
-  if (expected !== length) issue(`page ${id} is ${length} bytes but its header describes ${expected}`)
+  const decoded = decodePage(file.data.subarray(offset, offset + length), manifest)
+  const { clusterCount, vertexCount, indexCount, records, vertices, indices } = decoded
+  const floats = new Float32Array(records.buffer, records.byteOffset, records.length)
+  if (decoded.page !== id) issue(`page ${id} is headed ${decoded.page}`)
+  if (decoded.expectedBytes !== length) issue(`page ${id} is ${length} bytes but its header describes ${decoded.expectedBytes}`)
   if (clusterCount > manifest.maxPageClusters) issue(`page ${id} has ${clusterCount} clusters, manifest max is ${manifest.maxPageClusters}`)
   if (vertexCount > manifest.maxPageVertices) issue(`page ${id} has ${vertexCount} vertices, manifest max is ${manifest.maxPageVertices}`)
   if (indexCount > manifest.maxPageIndices) issue(`page ${id} has ${indexCount} indices, manifest max is ${manifest.maxPageIndices}`)
@@ -70,14 +71,12 @@ while (queue.length > 0) {
   stats.clusters += clusterCount
   stats.triangles += indexCount / 3
   stats.bytes += length
-  const vertexWord = HEADER_WORDS + clusterCount * RECORD_WORDS
-  const indexWord = vertexWord + vertexCount * FLOATS
   for (let c = 0; c < clusterCount; c++) {
-    const w = HEADER_WORDS + c * RECORD_WORDS
-    const [recordLevel, recordPage, childPage, indexOffset, indexLength, vertexOffset, vertexLength] = words.subarray(w, w + 7)
+    const w = c * RECORD_WORDS
+    const [recordLevel, recordPage, childPage, indexOffset, indexLength, vertexOffset, vertexLength] = records.subarray(w, w + 7)
     const selfError = floats[w + 7]
     const parentError = floats[w + 12]
-    const clusterId = words[w + 29]
+    const clusterId = records[w + 29]
     const where = `page ${id} cluster ${c}`
     if (recordLevel !== level) issue(`${where} says level ${recordLevel}, page is on ${level}`)
     if (recordPage !== id) issue(`${where} says page ${recordPage}`)
@@ -87,16 +86,16 @@ while (queue.length > 0) {
     if (clusterIds.has(clusterId)) issue(`${where} repeats cluster id ${clusterId}`)
     clusterIds.add(clusterId)
     for (let i = indexOffset; i < indexOffset + indexLength && i < indexCount; i++) {
-      const v = words[indexWord + i]
+      const v = indices[i]
       if (v < vertexOffset || v >= vertexOffset + vertexLength) { issue(`${where} index ${v} outside its vertices ${vertexOffset}+${vertexLength}`); break }
     }
     if (childPage !== NONE) {
-      queue.push({ id: childPage, level: words[w + 24], offset: words[w + 25], length: words[w + 26], parentLevel: level })
+      queue.push({ id: childPage, level: records[w + 24], offset: records[w + 25], length: records[w + 26], parentLevel: level })
     } else if (level !== 0) {
       issue(`${where} has no child page but is on level ${level}`)
     }
   }
-  if (scan) stats.geometry.push({ vertices: floats.subarray(vertexWord, vertexWord + vertexCount * FLOATS), indices: words.subarray(indexWord, indexWord + indexCount) })
+  if (scan) stats.geometry.push({ vertices, indices })
 }
 
 if (seen.size !== manifest.pageCount) issue(`${seen.size} pages reachable from the roots, manifest says ${manifest.pageCount}`)
