@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Builds a Theia cluster hierarchy from a glTF binary with meshoptimizer.
 //
-//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--force]
+//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--force]
 //
 // Level 0 is the master mesh (optionally pre-simplified to --target-tris) cut into meshlets.
 // Each further level merges small groups of adjacent clusters, simplifies the group with its
@@ -44,7 +44,7 @@ const fail = (message) => {
 }
 const [input, outDir] = positional
 if (!input || !outDir) {
-  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--force]")
+  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--force]")
 }
 if (!existsSync(input) || !statSync(input).isFile()) fail(`${input} is not a file`)
 if (existsSync(outDir) && readdirSync(outDir).length > 0) {
@@ -59,6 +59,10 @@ const maxGroupSize = Number(option("max-group", 8))
 const targetTriangles = Number(option("target-tris", 0))
 const meshChoice = option("mesh", null)
 const permissive = args.includes("--permissive")
+// Group clusters by meshoptimizer's partitioner (ported below) instead of the greedy pass
+const partition = args.includes("--partition")
+// meshoptimizer's Regularize: more even triangle sizes and shapes as groups simplify, at a small cost in error
+const simplifyFlags = args.includes("--regularize") ? ["LockBorder", "Regularize"] : ["LockBorder"]
 const FLOATS = 8 // px py pz nx ny nz u v
 const STRIDE = FLOATS // strides are in floats for the JS bindings
 const NONE = 0xffffffff
@@ -332,8 +336,145 @@ const clusterise = (vertices, indices) => {
   return clusters
 }
 
+// meshoptimizer's meshopt_partitionClusters (partition.cpp, MIT, Arseny Kapoulkine), ported:
+// Kurita's agglomerative clustering on a heap. Every cluster starts as a group; the group with
+// the fewest vertices is merged into the adjacent group that shares the most vertices with it,
+// the count normalised by each group's expected boundary (√vertices) and favouring groups whose
+// bounding spheres overlap, until groups reach the target; a spatial pass then merges what is
+// left small. Compact groups have short borders, and a group's border is what stays locked when
+// it simplifies, so the coarser levels keep fewer slivers. Unlike meshoptimizer's, groups never
+// exceed `groupSize`, since a group is a page and `--max-group` bounds every arena slot.
+const partitionClusters = (clusters, groupSize, byPosition) => {
+  const count = clusters.length
+  const total = clusters.reduce((n, c) => n + c.vertices.length / FLOATS, 0)
+  const all = new Float32Array(total * FLOATS)
+  let at = 0
+  for (const c of clusters) { all.set(c.vertices, at * FLOATS); at += c.vertices.length / FLOATS }
+  const remap = byPosition ? positionRemap(all) : weld(all, new Uint32Array(0)).remap
+  // Each cluster's distinct welded vertices, and the clusters each vertex belongs to.
+  const offsets = new Uint32Array(count + 1)
+  const lists = []
+  at = 0
+  clusters.forEach((cluster, c) => {
+    const n = cluster.vertices.length / FLOATS
+    const unique = new Set()
+    for (let i = 0; i < n; i++) unique.add(remap[at + i])
+    lists.push([...unique])
+    offsets[c + 1] = offsets[c] + unique.size
+    at += n
+  })
+  const owners = new Map()
+  lists.forEach((list, c) => { for (const v of list) { let o = owners.get(v); if (!o) owners.set(v, (o = [])); o.push(c) } })
+  const adjacency = lists.map((list, c) => {
+    const shared = new Map()
+    for (const v of list) for (const other of owners.get(v)) if (other !== c) shared.set(other, (shared.get(other) ?? 0) + 1)
+    return shared
+  })
+  const group = new Int32Array(count), next = new Int32Array(count).fill(-1), size = new Uint32Array(count).fill(1)
+  const vertices = new Float64Array(count), centre = new Float64Array(count * 3), radius = new Float64Array(count)
+  for (let c = 0; c < count; c++) {
+    group[c] = c
+    vertices[c] = lists[c].length
+    const v = clusters[c].vertices, n = v.length / FLOATS
+    let x = 0, y = 0, z = 0
+    for (let i = 0; i < n; i++) { x += v[i * FLOATS]; y += v[i * FLOATS + 1]; z += v[i * FLOATS + 2] }
+    x /= n; y /= n; z /= n
+    let r = 0
+    for (let i = 0; i < n; i++) r = Math.max(r, Math.hypot(v[i * FLOATS] - x, v[i * FLOATS + 1] - y, v[i * FLOATS + 2] - z))
+    centre[c * 3] = x; centre[c * 3 + 1] = y; centre[c * 3 + 2] = z; radius[c] = r
+  }
+  const boundsScore = (a, b) => {
+    const d = Math.hypot(centre[b * 3] - centre[a * 3], centre[b * 3 + 1] - centre[a * 3 + 1], centre[b * 3 + 2] - centre[a * 3 + 2])
+    const r1 = radius[a], r2 = radius[b]
+    const merged = d + r1 < r2 ? r2 : d + r2 < r1 ? r1 : (d + r2 + r1) / 2
+    return merged > 0 ? r1 / merged : 0
+  }
+  const mergeBounds = (into, from) => {
+    const r1 = radius[into], r2 = radius[from]
+    const dx = centre[from * 3] - centre[into * 3], dy = centre[from * 3 + 1] - centre[into * 3 + 1], dz = centre[from * 3 + 2] - centre[into * 3 + 2]
+    const d = Math.hypot(dx, dy, dz)
+    if (d + r1 < r2) { centre[into * 3] = centre[from * 3]; centre[into * 3 + 1] = centre[from * 3 + 1]; centre[into * 3 + 2] = centre[from * 3 + 2]; radius[into] = r2; return }
+    if (d + r2 > r1) {
+      const k = d > 0 ? (d + r2 - r1) / (2 * d) : 0
+      centre[into * 3] += dx * k; centre[into * 3 + 1] += dy * k; centre[into * 3 + 2] += dz * k
+      radius[into] = (d + r2 + r1) / 2
+    }
+  }
+  const link = (into, from) => { let tail = into; while (next[tail] >= 0) tail = next[tail]; next[tail] = from }
+  // A binary min-heap of [vertices, group].
+  const heap = []
+  const push = (item) => { heap.push(item); let i = heap.length - 1; while (i > 0 && heap[i][0] < heap[(i - 1) >> 1][0]) { const p = (i - 1) >> 1; [heap[i], heap[p]] = [heap[p], heap[i]]; i = p } }
+  const pop = () => {
+    const top = heap[0], last = heap.pop()
+    if (heap.length) { heap[0] = last; let i = 0; for (;;) { let j = i * 2 + 1; if (j >= heap.length) break; if (j + 1 < heap.length && heap[j + 1][0] < heap[j][0]) j++; if (heap[j][0] >= heap[i][0]) break; [heap[i], heap[j]] = [heap[j], heap[i]]; i = j } }
+    return top
+  }
+  for (let c = 0; c < count; c++) push([vertices[c], c])
+  while (heap.length) {
+    const [, id] = pop()
+    if (size[id] === 0) continue
+    for (let i = id; i >= 0; i = next[i]) group[i] = -1
+    if (size[id] >= groupSize) continue
+    const acc = new Map()
+    for (let ci = id; ci >= 0; ci = next[ci]) for (const [other, n] of adjacency[ci]) { const g = group[other]; if (g >= 0) acc.set(g, (acc.get(g) ?? 0) + n) }
+    let best = -1, bestScore = 0, bestShared = 0
+    const own = 1 / Math.sqrt(vertices[id])
+    for (const [g, shared] of acc) {
+      if (size[id] + size[g] > groupSize) continue
+      const score = shared * (own + 1 / Math.sqrt(vertices[g])) * (1 + 0.4 * boundsScore(id, g))
+      if (score > bestScore) { best = g; bestScore = score; bestShared = shared }
+    }
+    if (best === -1) continue
+    link(id, best)
+    size[id] += size[best]
+    vertices[id] = Math.max(1, vertices[id] + vertices[best] - bestShared)
+    size[best] = 0
+    vertices[best] = 0
+    mergeBounds(id, best)
+    radius[best] = 0
+    for (let i = id; i >= 0; i = next[i]) group[i] = id
+    push([vertices[id], id])
+  }
+  // Spatial pass: groups still under the target merge with nearby ones, within leaves of a median split.
+  const order = []
+  for (let c = 0; c < count; c++) if (size[c]) order.push(c)
+  const mergeLeaf = (ids) => {
+    for (const id of ids) {
+      if (size[id] === 0 || size[id] >= groupSize) continue
+      let best = -1, bestScore = -1
+      for (const other of ids) {
+        if (other === id || size[other] === 0 || size[id] + size[other] > groupSize) continue
+        const score = boundsScore(id, other)
+        if (score > bestScore) { bestScore = score; best = other }
+      }
+      if (best !== -1) { link(best, id); size[best] += size[id]; size[id] = 0; mergeBounds(best, id); radius[id] = 0 }
+    }
+  }
+  const mergeSpatial = (ids, depth) => {
+    const total = ids.reduce((n, id) => n + size[id], 0)
+    if (total <= groupSize || ids.length <= 8 || depth >= 40) return mergeLeaf(ids)
+    const mean = [0, 0, 0], vars = [0, 0, 0]
+    ids.forEach((id, i) => { for (let k = 0; k < 3; k++) { const p = centre[id * 3 + k], delta = p - mean[k]; mean[k] += delta / (i + 1); vars[k] += delta * (p - mean[k]) } })
+    const axis = vars[0] >= vars[1] && vars[0] >= vars[2] ? 0 : vars[1] >= vars[2] ? 1 : 2
+    let low = ids.filter((id) => centre[id * 3 + axis] < mean[axis]), high = ids.filter((id) => centre[id * 3 + axis] >= mean[axis])
+    if (low.length <= 4 || high.length <= 4) { const sorted = [...ids].sort((a, b) => centre[a * 3 + axis] - centre[b * 3 + axis]); low = sorted.slice(0, sorted.length >> 1); high = sorted.slice(sorted.length >> 1) }
+    mergeSpatial(low, depth + 1)
+    mergeSpatial(high, depth + 1)
+  }
+  mergeSpatial(order, 0)
+  const groups = []
+  for (let c = 0; c < count; c++) {
+    if (!size[c]) continue
+    const members = []
+    for (let i = c; i >= 0; i = next[i]) members.push(i)
+    groups.push(members)
+  }
+  return groups
+}
+
 // Greedy grouping of adjacent clusters, groupSize at a time, by welding the whole level
 const groupClusters = (clusters, groupSize, byPosition = false) => {
+  if (partition) return partitionClusters(clusters, groupSize, byPosition)
   const total = clusters.reduce((n, c) => n + c.vertices.length / FLOATS, 0)
   const all = new Float32Array(total * FLOATS)
   let at = 0
@@ -443,14 +584,14 @@ for (let level = 1; level < 32 && current.length > 1; level++) {
     const target = Math.max(3, Math.floor(indices.length / 2 / 3) * 3)
     const attributes = attributesOf(vertices)
     let source = indices
-    let [simplified] = MeshoptSimplifier.simplifyWithAttributes(source, vertices, STRIDE, attributes, 5, attributeWeights, null, target, 1.0, ["LockBorder"])
+    let [simplified] = MeshoptSimplifier.simplifyWithAttributes(source, vertices, STRIDE, attributes, 5, attributeWeights, null, target, 1.0, simplifyFlags)
     if (permissive && (acrossSeams || simplified.length >= indices.length * 0.9)) {
       // Collapsing across seams: one vertex per position, so each kept vertex brings the UV of
       // whichever island it came from. meshoptimizer's own Permissive flag is not enough here, as
       // it still locks vertices where three or more islands meet, which is most of them.
       const remap = positionRemap(vertices)
       const across = indices.map((i) => remap[i])
-      const [retried] = MeshoptSimplifier.simplifyWithAttributes(across, vertices, STRIDE, attributes, 5, attributeWeights, null, target, 1.0, ["LockBorder"])
+      const [retried] = MeshoptSimplifier.simplifyWithAttributes(across, vertices, STRIDE, attributes, 5, attributeWeights, null, target, 1.0, simplifyFlags)
       if (retried.length < indices.length * 0.9) {
         source = across
         simplified = retried
@@ -460,7 +601,7 @@ for (let level = 1; level < 32 && current.length > 1; level++) {
     // The attribute-aware result keeps UVs and normals honest, but its error folds attribute
     // terms in; a position-only pass to the same target gives the geometric error to store,
     // which is what screen-space selection should be judged by
-    const [, relativeError] = MeshoptSimplifier.simplify(source, vertices, STRIDE, target, 1.0, ["LockBorder"])
+    const [, relativeError] = MeshoptSimplifier.simplify(source, vertices, STRIDE, target, 1.0, simplifyFlags)
     // meshoptimizer reports error relative to the extent of the mesh it was given, the group
     const groupScale = MeshoptSimplifier.getScale(vertices, STRIDE)
 

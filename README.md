@@ -68,7 +68,7 @@ Occlusion culling holds rather than hides. The depth grid is read back a frame o
 ## Building a hierarchy
 
 ```
-theia build source.glb out/dir [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--force]
+theia build source.glb out/dir [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--force]
 ```
 
 The input is a glTF binary holding the mesh as one indexed primitive with positions and a UV set and no compression extensions; anything else is refused with a message and a non-zero exit. A file with several meshes needs `--mesh` to pick one (the refusal lists them). Normals are used when present and computed from the faces otherwise. The output folder must be empty unless `--force` is given, which replaces its contents, so a rebuild never leaves stale level files behind. `--target-tris` pre-simplifies the input with meshoptimizer, which copes with a few million triangles; above that, decimate in a DCC tool first. Expect to raise Node's heap for large inputs (`node --max-old-space-size=24000` handled 29 million triangles in about two and a half minutes). The output folder holds `manifest.json` and one binary file per level; serve it as static files from a host that honours HTTP `Range` requests and does not compress the binaries. The layout is written down in [formats.md](docs/formats.md).
@@ -82,6 +82,8 @@ The input is a glTF binary holding the mesh as one indexed primitive with positi
 | `--target-tris` | none | pre-simplify the input to this many triangles before clustering |
 | `--mesh` | the only one | which mesh to build when the file has several, by name or index |
 | `--permissive` | off | for UV layouts broken into many small islands (photogrammetry): group clusters by position, and once a level carries up more than a quarter of its clusters, simplify every later group across UV seams. Closes the hierarchy at the price of texture stretched across the seams those levels crossed |
+| `--partition` | off | group clusters with meshoptimizer's partitioner (agglomerative, by shared boundary normalised by each group's expected boundary, ported from `meshopt_partitionClusters`) instead of the greedy pass. Compact groups lock less border, which lowers the floor of a hierarchy over UV charts (a re-unwrapped scan's coarsest level fell by about 40%) |
+| `--regularize` | off | simplify with meshoptimizer's `Regularize`: more even triangle sizes and shapes at a small cost in error. With `--partition`, slivers under 3° at a scan's middle levels roughly halve |
 | `--force` | off | replace the contents of a non-empty output folder |
 
 The build ends with a table of pages, clusters, triangles and bytes per level. Two details worth knowing: after each level is simplified every vertex normal is recomputed from the level's own faces, area weighted and shared across UV seams and cluster copies, because normals carried through the simplifier as attributes end up pointing away from the faces they sit on and show as dark wedges. Level 0 keeps the source normals unless `--target-tris` pre-simplified it. And the manifest carries a `build` token that the runtime appends to the binary file URLs: the files are byte-range fetched, so a rebuilt hierarchy served from a cache of the old one would arrive short. The manifest itself is fetched with `cache: "no-cache"`.
