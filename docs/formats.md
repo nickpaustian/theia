@@ -4,6 +4,39 @@ The layouts the build tools write and the runtimes read. The hierarchy carries a
 
 All multi-byte values are little-endian. "Word" means a 32-bit unsigned integer unless marked `f32`.
 
+## Format 4
+
+Format 3 with each cluster record packed to 17 words on the wire. The runtimes expand a record to the 32-word layout below when a page lands, so nothing downstream of the decoder changes. `theia build` writes format 4 by default; `theia repack` rewrites a format 3 or 4 hierarchy in it, on a coarser position grid if asked.
+
+### manifest.json
+
+As format 3, with `format` 4 and:
+
+| field | meaning |
+| --- | --- |
+| `wireRecordWords` | 17 |
+| `recordGrid` | `{ origin: [x, y, z], step }`: the grid the records' sphere centres, radii and cone apexes are on, the quantisation's extent at 16 bits an axis |
+
+### Packed cluster record (17 words)
+
+| word | content |
+| --- | --- |
+| 0 | `u8` level, `u8` child page level (255 for none), `u8` vertex count, `u8` zero |
+| 1 | `u16` index offset, `u16` index count |
+| 2 | `u16` vertex offset, `unorm16` UV centroid u |
+| 3 | `unorm16` UV centroid v, `snorm16` cone cutoff (rounded up) |
+| 4 | child page id, or `0xFFFFFFFF` |
+| 5, 6 | child page byte offset and length |
+| 7 | cluster id |
+| 8 | `f32` self error |
+| 9 | `f32` parent error |
+| 10, 11 | self bounds: `u16` cx cy cz on the record grid, `u16` radius in grid steps (rounded up by a step and a half, so the sphere still holds the cluster) |
+| 12, 13 | parent bounds, the same |
+| 14, 15 | cone apex `u16` xyz on the record grid, then the axis as `snorm16` octahedral u |
+| 16 | octahedral v, `u16` zero |
+
+Page ids are not stored per record: the page header carries the id, and the decoder fills word 1.
+
 ## Format 3
 
 Format 2 with the geometry packed: each vertex is quantised to 20 bytes and the vertices and indices of a page go through [meshoptimizer](https://github.com/zeux/meshoptimizer)'s vertex and index codecs. On scans this is three to four times smaller than format 2 (a 10 KB page becomes 2.5 to 3 KB), and the records, unchanged, become about a fifth of a page. Everything else (manifest, roots, records, byte ranges) is as in format 2; the runtimes read both.

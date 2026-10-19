@@ -303,7 +303,7 @@ export default class ClusteredMesh extends THREE.Mesh {
     if (!FORMATS.includes(manifest.format) || manifest.recordWords !== RECORD_WORDS) {
       throw new Error(`Theia: ${base} is format ${manifest.format}; this build reads ${FORMATS.join(" and ")}. Rebuild it with "theia build"`)
     }
-    if (manifest.format === 3 && !manifest.quantisation) throw new Error(`Theia: ${base} is format 3 but its manifest has no quantisation`)
+    if (manifest.format >= 3 && !manifest.quantisation) throw new Error(`Theia: ${base} is format ${manifest.format} but its manifest has no quantisation`)
     await codecReady(manifest.format)
     const mesh = new ClusteredMesh(base, manifest, options)
     await mesh.loadRoots()

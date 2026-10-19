@@ -84,7 +84,8 @@ The input is a glTF binary holding the mesh as one indexed primitive with positi
 | `--permissive` | off | for UV layouts broken into many small islands (photogrammetry): group clusters by position, and once a level carries up more than a quarter of its clusters, simplify every later group across UV seams. Closes the hierarchy at the price of texture stretched across the seams those levels crossed |
 | `--partition` | off | group clusters with meshoptimizer's partitioner (agglomerative, by shared boundary normalised by each group's expected boundary, ported from `meshopt_partitionClusters`) instead of the greedy pass. Compact groups lock less border, which lowers the floor of a hierarchy over UV charts (a re-unwrapped scan's coarsest level fell by about 40%) |
 | `--regularize` | off | simplify with meshoptimizer's `Regularize`: more even triangle sizes and shapes at a small cost in error. With `--partition`, slivers under 3° at a scan's middle levels roughly halve |
-| `--position-bits` | 20 | bits per axis of the grid positions are quantised on (format 3): 20 is a step under a micron on a metre-sized object; 16 saves about 15% more |
+| `--position-bits` | 16 | bits per axis of the grid positions are quantised on: 16 is a step of 15 microns on a metre-sized object, below what a scan resolves; 20 is under a micron and a seventh more vertex bytes on the wire |
+| `--format` | 4 | 4 packs each cluster record to 17 words on the wire, expanded to the 32-word layout when a page lands; 3 writes records as the runtime reads them |
 | `--force` | off | replace the contents of a non-empty output folder |
 
 The build ends with a table of pages, clusters, triangles and bytes per level. Two details worth knowing: after each level is simplified every vertex normal is recomputed from the level's own faces, area weighted and shared across UV seams and cluster copies, because normals carried through the simplifier as attributes end up pointing away from the faces they sit on and show as dark wedges. Level 0 keeps the source normals unless `--target-tris` pre-simplified it. And the manifest carries a `build` token that the runtime appends to the binary file URLs: the files are byte-range fetched, so a rebuilt hierarchy served from a cache of the old one would arrive short. The manifest itself is fetched with `cache: "no-cache"`.
@@ -100,6 +101,15 @@ theia normalise source.fbx source.glb [--reference other.glb] [--size N] [--orig
 `--size` sets the largest extent; `--reference` matches it to another glTF's mesh instead, and `--origin match` also puts the bounds centre where that reference's is. By default the origin goes to the surface centre of mass, which suits a camera that orbits the object; `bounds` uses the bounding-box centre and `keep` leaves it. Blender is found on the PATH, in the usual install locations, or from `--blender` or the `BLENDER` environment variable. It is the only command that needs it.
 
 The `theia` command runs from the package (`npx theia`, or on the path after a global install). `theia --help` lists the commands.
+
+
+## Repacking a build
+
+```
+theia repack in/dir out/dir [--position-bits 16] [--force]
+```
+
+Rewrites a built hierarchy in format 4 on a coarser position grid without rebuilding it: the same clusters, pages and errors, so a viewer's cut is unchanged, with the vertices requantised and each cluster record packed to 17 words on the wire. A format 3 build at 20 bits becomes about 17% smaller at 16.
 
 ## Inspecting and previewing a build
 

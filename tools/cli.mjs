@@ -2,6 +2,7 @@
 const commands = {
   normalise: ["./normalise.mjs", "normalise <in.fbx|glb> <out.glb> [options]  bake transforms and centre a mesh with Blender"],
   build: ["./build-clusters.mjs", "build <mesh.glb> <outDir> [options]         cut a mesh into a streamable cluster hierarchy"],
+  repack: ["./repack.mjs", "repack <inDir> <outDir> [--position-bits 16]     rewrite a built hierarchy in format 4 on a coarser grid"],
   inspect: ["./inspect.mjs", "inspect <dir> [--no-scan]                    check a built hierarchy and summarise it per level"],
   preview: ["./preview.mjs", "preview <dir> [--port N] [--no-open]         serve a hierarchy and view it in the browser"],
 }

@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // Builds a Theia cluster hierarchy from a glTF binary with meshoptimizer.
 //
-//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--position-bits 20] [--force]
+//   theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--position-bits 16] [--format 4] [--force]
 //
 // Level 0 is the master mesh (optionally pre-simplified to --target-tris) cut into meshlets.
 // Each further level merges small groups of adjacent clusters, simplifies the group with its
@@ -35,7 +35,7 @@ import { readFileSync, writeFileSync, mkdirSync, existsSync, readdirSync, rmSync
 import { join, basename } from "node:path"
 import { MeshoptClusterizer } from "meshoptimizer/clusterizer"
 import { MeshoptSimplifier } from "meshoptimizer/simplifier"
-import { codecReady, encodeBlocks, quantisationFor, VERTEX_BYTES, headerWords } from "./page.mjs"
+import { codecReady, encodeBlocks, packRecords, quantisationFor, recordGridFor, VERTEX_BYTES, headerWords, wireRecordWords } from "./page.mjs"
 
 const args = process.argv.slice(2)
 const positional = args.filter((a) => !a.startsWith("--"))
@@ -49,7 +49,7 @@ const fail = (message) => {
 }
 const [input, outDir] = positional
 if (!input || !outDir) {
-  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--position-bits 20] [--force]")
+  fail("usage: theia build <input.glb> <outDir> [--max-tris 124] [--max-verts 64] [--group 4] [--max-group 8] [--target-tris N] [--mesh name|index] [--permissive] [--partition] [--regularize] [--position-bits 16] [--format 4] [--force]")
 }
 if (!existsSync(input) || !statSync(input).isFile()) fail(`${input} is not a file`)
 if (existsSync(outDir) && readdirSync(outDir).length > 0) {
@@ -68,8 +68,12 @@ const permissive = args.includes("--permissive")
 const partition = args.includes("--partition")
 // meshoptimizer's Regularize: more even triangle sizes and shapes as groups simplify, at a small cost in error
 const simplifyFlags = args.includes("--regularize") ? ["LockBorder", "Regularize"] : ["LockBorder"]
-// Bits per axis of the position grid; 20 puts a step under a micron on a metre-sized object
-const positionBits = Number(option("position-bits", 20))
+// Bits per axis of the position grid; 16 puts a step at 15 microns on a metre-sized object, below
+// what a scan resolves, and the vertex bytes on the wire are a seventh smaller than at 20
+const positionBits = Number(option("position-bits", 16))
+// 4 packs each record to 17 words on the wire; 3 writes the 32-word layout as is
+const format = Number(option("format", 4))
+if (format !== 3 && format !== 4) fail("--format must be 3 or 4")
 if (!(positionBits >= 8 && positionBits <= 32)) fail("--position-bits must be between 8 and 32")
 await codecReady()
 const FLOATS = 8 // px py pz nx ny nz u v
@@ -685,6 +689,7 @@ for (const page of pages) for (const c of page.clusters) for (let i = 0; i < c.v
   if (value > gridMax[k]) gridMax[k] = value
 }
 const quantisation = quantisationFor(gridMin, gridMax, positionBits)
+const recordGrid = recordGridFor(quantisation)
 let uvClamped = 0
 const pageSizes = pages.map((page) => {
   let vertexCount = 0, indexCount = 0
@@ -700,7 +705,7 @@ const pageSizes = pages.map((page) => {
   }
   const blocks = encodeBlocks(vertices, indices, quantisation)
   uvClamped += blocks.uvClamped
-  return { vertexCount, indexCount, blocks, byteLength: (HEADER_WORDS + page.clusters.length * RECORD_WORDS) * 4 + blocks.byteLength }
+  return { vertexCount, indexCount, blocks, byteLength: (HEADER_WORDS + page.clusters.length * wireRecordWords(format)) * 4 + blocks.byteLength }
 })
 const pageRanges = pages.map((page, pageId) => {
   const range = { level: page.level, offset: levelBytes[page.level], length: pageSizes[pageId].byteLength }
@@ -743,14 +748,18 @@ pages.forEach((page, pageId) => {
   const bytes = new Uint8Array(words.buffer)
   words[0] = pageId; words[1] = page.clusters.length; words[2] = vertexCount; words[3] = indexCount
   words[4] = blocks.vertexBlock.byteLength; words[5] = blocks.indexBlock.byteLength
+  // Records are built in the 32-word layout and, in format 4, packed on their way into the page.
+  const recordWords = new Uint32Array(page.clusters.length * RECORD_WORDS)
+  const recordFloats = new Float32Array(recordWords.buffer)
   let v = 0, i = 0
   page.clusters.forEach((c, n) => {
-    writeRecord(words, floats, HEADER_WORDS + n * RECORD_WORDS, c, pageId, i, v)
+    writeRecord(recordWords, recordFloats, n * RECORD_WORDS, c, pageId, i, v)
     maxClusterVertices = Math.max(maxClusterVertices, c.vertices.length / FLOATS)
     v += c.vertices.length / FLOATS
     i += c.indices.length
   })
-  const vertexStart = (HEADER_WORDS + page.clusters.length * RECORD_WORDS) * 4
+  words.set(format === 4 ? packRecords(recordWords, page.clusters.length, recordGrid) : recordWords, HEADER_WORDS)
+  const vertexStart = (HEADER_WORDS + page.clusters.length * wireRecordWords(format)) * 4
   bytes.set(blocks.vertexBlock, vertexStart)
   bytes.set(blocks.indexBlock, vertexStart + ((blocks.vertexBlock.byteLength + 3) & ~3))
   levelBuffers[page.level].push(Buffer.from(words.buffer))
@@ -775,7 +784,7 @@ const rootSphere = (() => {
   return [centre[0], centre[1], centre[2], radius]
 })()
 const manifest = {
-  format: 3,
+  format,
   name: mesh.name,
   // Cache-buster for the binary files, which are byte-range fetched and change size per build
   build: Date.now().toString(36),
@@ -784,6 +793,7 @@ const manifest = {
   recordWords: RECORD_WORDS,
   vertexBytes: VERTEX_BYTES,
   quantisation,
+  ...(format === 4 ? { wireRecordWords: wireRecordWords(4), recordGrid } : {}),
   clusterCount: clusterIds.size,
   pageCount: pages.length,
   levels: levelBuffers.map((_, level) => ({ file: `level-${level}.bin`, byteLength: levelBytes[level] })),
@@ -798,7 +808,7 @@ const manifest = {
 }
 writeFileSync(join(outDir, "manifest.json"), JSON.stringify(manifest))
 const total = levelBytes.reduce((n, b) => n + b, 0)
-const records = clusterIds.size * RECORD_WORDS * 4 + pages.length * HEADER_WORDS * 4
+const records = clusterIds.size * wireRecordWords(format) * 4 + pages.length * HEADER_WORDS * 4
 const summary = levelBytes.map((bytes, level) => {
   const levelPages = pages.filter((p) => p.level === level)
   const clusters = levelPages.reduce((n, p) => n + p.clusters.length, 0)
