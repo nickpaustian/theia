@@ -117,4 +117,15 @@ describe("PageScheduler", () => {
     expect([...got.keys()].sort()).toEqual([0, 1])
     expect(scheduler.has(2)).toBe(true)
   })
+
+  it("ranks pooled pages by priority per byte when asked", () => {
+    const waiting: number[] = []
+    const client: PoolClient = { submit(priority): PoolTicket { waiting.push(priority); return { setPriority: () => {}, cancel: () => {}, started: false } } }
+    const { fetch } = host()
+    const scheduler = new PageScheduler(pages([[0, 0, 100], [0, 40_000, 400]]), () => {}, { fetch, pool: client, valuePerByte: true })
+    scheduler.want(0, 2, 1)
+    scheduler.want(1, 2, 1)
+    scheduler.endPass(1)
+    expect(waiting).toEqual([0.02, 0.005])
+  })
 })

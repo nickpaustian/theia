@@ -3,7 +3,9 @@ import type { PoolClient } from "./pool.js"
 import type { FetchLike } from "./PageScheduler.js"
 import PageScheduler, { type PageSchedulerOptions, type PageSchedulerStats } from "./PageScheduler.js"
 import OcclusionPass, { type OcclusionPassOptions } from "./OcclusionPass.js"
-import { codecReady, decodePage, FORMATS, type Quantisation } from "./pageCodec.js"
+import { codecReady, FORMATS, type Quantisation } from "./pageCodec.js"
+import PageDecoder from "./PageDecoder.js"
+import type { PreparedPage } from "./pageDecode.js"
 
 export interface PageRange {
   level: number
@@ -78,6 +80,17 @@ export interface ClusteredMeshOptions {
   // multi-draw; on ANGLE's Metal backend the extension loops draw calls and loses
   drawMode?: DrawMode
   scheduler?: PageSchedulerOptions
+  // Workers that decode pages (meshoptimizer, dequantise, deinterleave) off the main thread;
+  // 0 decodes inline. Default one fewer than the cores, at most 4. Ignored with `decoder`
+  decodeWorkers?: number
+  // A decoder to share with other meshes; the mesh does not dispose it
+  decoder?: PageDecoder
+  // Milliseconds of main-thread time a frame may spend landing decoded pages into the arena;
+  // at least one lands a frame, the rest wait their turn
+  landingBudgetMs?: number
+  // When the arena is full and pages are still wanted, raise the error threshold until the cut
+  // fits, and lower it as room returns (see the errorScale field and stat)
+  budget?: boolean
   // A client of a shared fetch pool (@nickpaustian/tethys), when Theia streams alongside other modules
   pool?: PoolClient
   // Used for the manifest and every page request; the global fetch by default
@@ -110,19 +123,24 @@ export interface ClusteredMeshStats {
   cullMode: CullMode
   multiDrawExtension: boolean
   indexRebuilds: number
+  // Pages decoded and waiting for a frame with landing budget, and pages still decoding
+  landingQueue: number
+  decoding: number
+  decodeWorkers: number
+  // What the error threshold is multiplied by while the arena cannot hold the cut; 1 when it can
+  errorScale: number
 }
 
-const FLOATS = 8
 const NONE = 0xffffffff
 // A page: header, one record per cluster, vertices, indices (decoded by pageCodec). Record
 // layout in 32-bit words
 const RECORD_WORDS = 32
-const C_LEVEL = 0, C_CHILD_PAGE = 2, C_INDEX_OFFSET = 3, C_INDEX_COUNT = 4, C_VERTEX_OFFSET = 5, C_VERTEX_COUNT = 6
+const C_LEVEL = 0, C_CHILD_PAGE = 2, C_INDEX_OFFSET = 3, C_INDEX_COUNT = 4
 // words 12..16 hold the parent error and bounds; the traversal never needs them because a
 // page is only reached through a parent that already failed that exact test
 const C_SELF_ERROR = 7, C_SELF_BOUNDS = 8, C_CONE = 17
 // the page beneath: level, byte offset, byte length; then the UV centroid and a cluster id
-const C_CHILD_LEVEL = 24, C_CHILD_OFFSET = 25, C_CHILD_LENGTH = 26, C_ID = 29
+const C_CHILD_LEVEL = 24, C_CHILD_OFFSET = 25, C_CHILD_LENGTH = 26
 
 // A mesh that walks a cluster hierarchy top-down each frame, drawing each cluster whose
 // screen-space error is small enough and descending into the page beneath the ones that are
@@ -163,6 +181,19 @@ export default class ClusteredMesh extends THREE.Mesh {
   public cullMode: CullMode
   public readonly occlusion: OcclusionPass
   public drawMode: DrawMode
+  public landingBudgetMs: number
+  public budget: boolean
+  // Multiplies pixelError while the arena is full and pages are still wanted, raised a quarter
+  // at a time and eased back once the wants are met with room to spare
+  public errorScale: number = 1
+  public readonly decoder: PageDecoder
+  private ownsDecoder: boolean
+  private landings: Array<{ page: number; prepared: PreparedPage }> = []
+  private landingPages: Set<number> = new Set()
+  private decoding: number = 0
+  private landed: number = 0
+  private landedAtBudget: number = 0
+  private lastBudget: number = 0
   private ownsMaterial: boolean = false
   private fetch: FetchLike
   private materialPatch: {
@@ -198,6 +229,9 @@ export default class ClusteredMesh extends THREE.Mesh {
   private indexRebuilds: number = 0
   private pageSlot: Int32Array
   private slotPage: Int32Array
+  // Slots fill in order; below this every slot is taken, so an allocation only scans for an
+  // eviction once the arena is full
+  private firstFreeSlot: number = 0
   private slotLastUsed: Float64Array
   private rootPages: Set<number>
   private multiDrawExtension: boolean | null = null
@@ -252,6 +286,10 @@ export default class ClusteredMesh extends THREE.Mesh {
     this.drawMode = "compact"
     if (options.drawMode === "ranges") this.setDrawMode("ranges")
     this.frustumCulled = false
+    this.landingBudgetMs = options.landingBudgetMs ?? 3
+    this.budget = options.budget ?? true
+    this.ownsDecoder = !options.decoder
+    this.decoder = options.decoder ?? new PageDecoder({ workers: options.decodeWorkers })
 
     this.slotClusters = manifest.maxPageClusters
     this.slotRecords = new Uint32Array(slots * this.slotClusters * RECORD_WORDS)
@@ -281,10 +319,13 @@ export default class ClusteredMesh extends THREE.Mesh {
     )
     this._matricesTexture.needsUpdate = true
 
+    // Neighbouring pages coalesce into one request when they lie within about a page of each
+    // other: a fixed gap fetches several pages of filler on a tightly packed build
+    const meanPageBytes = Math.max(1024, Math.round(manifest.levels.reduce((n, l) => n + l.byteLength, 0) / Math.max(1, manifest.pageCount)))
     this.scheduler = new PageScheduler(
       (id) => this.rangeOf(id),
       (id, buffer) => this.receive(id, buffer),
-      { ...options.scheduler, ...(options.pool ? { pool: options.pool } : {}), ...(options.fetch ? { fetch: options.fetch } : {}) }
+      { coalesceGap: meanPageBytes, ...options.scheduler, ...(options.pool ? { pool: options.pool } : {}), ...(options.fetch ? { fetch: options.fetch } : {}) }
     )
     this.ownsMaterial = !options.material
     this.fetch = options.fetch ?? ((url, init) => fetch(url, init))
@@ -329,28 +370,66 @@ export default class ClusteredMesh extends THREE.Mesh {
         const response = await this.fetch(url, { headers: { Range: `bytes=${offset}-${offset + length - 1}` } })
         let buffer = await response.arrayBuffer()
         if (response.status !== 206) buffer = buffer.slice(offset, offset + length)
-        this.receive(page, buffer)
+        this.checkLength(page, buffer)
+        this.land(page, await this.decoder.decode(buffer, this.manifest))
       })
     )
   }
 
+  private checkLength(page: number, buffer: ArrayBuffer): void {
+    const expected = this.pageRanges.get(page)?.length ?? 0
+    if (buffer.byteLength < expected) {
+      throw new Error(`Theia: page ${page} arrived short (${buffer.byteLength} of ${expected} bytes); a cached file from an older build?`)
+    }
+  }
+
+  // A fetched page is decoded (in a worker when there is one), queued, and landed by a frame
+  // with budget to spare; a page already resident or on its way is not taken twice
   private receive(page: number, buffer: ArrayBuffer): void {
+    if (this.pageSlot[page] >= 0 || this.landingPages.has(page)) return
+    this.checkLength(page, buffer)
+    this.landingPages.add(page)
+    this.decoding++
+    this.decoder.decode(buffer, this.manifest).then(
+      (prepared) => {
+        this.decoding--
+        if (this.landingPages.has(page)) this.landings.push({ page, prepared })
+      },
+      (error: Error) => {
+        this.decoding--
+        this.landingPages.delete(page)
+        this.scheduler.dropped(page, this.frame)
+        console.warn("[theia] page failed to decode", page, error)
+      }
+    )
+  }
+
+  // Lands queued pages until the frame's budget is spent, at least one a frame so the queue
+  // always moves
+  private landPending(): void {
+    if (this.landings.length === 0) return
+    const start = performance.now()
+    let landed = 0
+    while (this.landings.length > 0 && (landed === 0 || performance.now() - start < this.landingBudgetMs)) {
+      const { page, prepared } = this.landings.shift()!
+      this.landingPages.delete(page)
+      this.land(page, prepared)
+      landed++
+    }
+  }
+
+  private land(page: number, prepared: PreparedPage): void {
     if (this.pageSlot[page] >= 0) return
+    if (prepared.page !== page) throw new Error(`Theia: page ${page} payload is headed ${prepared.page}`)
     const slot = this.allocateSlot()
     if (slot === -1) {
       this.droppedPages++
       this.scheduler.dropped(page, this.frame)
       return
     }
-    const expected = this.pageRanges.get(page)?.length ?? 0
-    if (buffer.byteLength < expected) {
-      throw new Error(`Theia: page ${page} arrived short (${buffer.byteLength} of ${expected} bytes); a cached file from an older build?`)
-    }
-    const decoded = decodePage(buffer, this.manifest)
-    if (decoded.page !== page) throw new Error(`Theia: page ${page} payload is headed ${decoded.page}`)
-    const { clusterCount, vertices, indices } = decoded
+    const { clusterCount, indices } = prepared
     const recordBase = slot * this.slotClusters * RECORD_WORDS
-    this.slotRecords.set(decoded.records, recordBase)
+    this.slotRecords.set(prepared.records, recordBase)
     this.slotClusterCount[slot] = clusterCount
     for (let c = 0; c < clusterCount; c++) {
       const w = recordBase + c * RECORD_WORDS
@@ -363,11 +442,12 @@ export default class ClusteredMesh extends THREE.Mesh {
         })
       }
     }
-    this.writeVertices(slot, vertices)
+    this.writeVertices(slot, prepared)
     this.writeIndices(slot, indices)
     this.pageSlot[page] = slot
     this.slotPage[slot] = page
     this.slotLastUsed[slot] = performance.now()
+    this.landed++
   }
 
   // The page's indices, rebased onto its slot's vertices, into the slot's region of the
@@ -448,12 +528,12 @@ export default class ClusteredMesh extends THREE.Mesh {
   }
 
   private allocateSlot(): number {
+    if (this.firstFreeSlot < this.slotCount) return this.firstFreeSlot++
     let best = -1
     let oldest = Infinity
     const minIdle = performance.now() - this.protectMs
     for (let slot = 0; slot < this.slotCount; slot++) {
       const page = this.slotPage[slot]
-      if (page === -1) return slot
       if (this.rootPages.has(page)) continue
       const used = this.slotLastUsed[slot]
       if (used >= minIdle) continue
@@ -471,38 +551,28 @@ export default class ClusteredMesh extends THREE.Mesh {
   }
 
   private availableSlots(): number {
-    let count = 0
+    let count = this.slotCount - this.firstFreeSlot
     const minIdle = performance.now() - this.protectMs
-    for (let slot = 0; slot < this.slotCount; slot++) {
+    for (let slot = 0; slot < this.firstFreeSlot; slot++) {
       const page = this.slotPage[slot]
       if (page === -1 || (!this.rootPages.has(page) && this.slotLastUsed[slot] < minIdle)) count++
     }
     return count
   }
 
-  private writeVertices(slot: number, vertices: Float32Array): void {
+  // The prepared arrays go into the slot's region of each attribute in one copy
+  private writeVertices(slot: number, prepared: PreparedPage): void {
     const geometry = this.geometry
     const position = geometry.getAttribute("position") as THREE.BufferAttribute
     const normal = geometry.getAttribute("normal") as THREE.BufferAttribute
     const uv = geometry.getAttribute("uv") as THREE.BufferAttribute
     const info = geometry.getAttribute("theiaInfo") as THREE.BufferAttribute
     const base = slot * this.slotVertices
-    const count = vertices.length / FLOATS
-    for (let v = 0; v < count; v++) {
-      const src = v * FLOATS
-      position.setXYZ(base + v, vertices[src], vertices[src + 1], vertices[src + 2])
-      normal.setXYZ(base + v, vertices[src + 3], vertices[src + 4], vertices[src + 5])
-      uv.setXY(base + v, vertices[src + 6], vertices[src + 7])
-    }
-    const recordBase = slot * this.slotClusters * RECORD_WORDS
-    for (let c = 0; c < this.slotClusterCount[slot]; c++) {
-      const w = recordBase + c * RECORD_WORDS
-      const level = this.slotRecords[w + C_LEVEL]
-      const id = this.slotRecords[w + C_ID]
-      const from = this.slotRecords[w + C_VERTEX_OFFSET]
-      const n = this.slotRecords[w + C_VERTEX_COUNT]
-      for (let v = 0; v < n; v++) info.setXY(base + from + v, level, id)
-    }
+    const count = prepared.vertexCount
+    ;(position.array as Float32Array).set(prepared.positions, base * 3)
+    ;(normal.array as Float32Array).set(prepared.normals, base * 3)
+    ;(uv.array as Float32Array).set(prepared.uvs, base * 2)
+    ;(info.array as Float32Array).set(prepared.info, base * 2)
     for (const attribute of [position, normal, uv, info]) {
       attribute.addUpdateRange(base * attribute.itemSize, count * attribute.itemSize)
       attribute.needsUpdate = true
@@ -519,6 +589,7 @@ export default class ClusteredMesh extends THREE.Mesh {
     if (this.frozen) return
     this.frame++
     this.pass++
+    this.landPending()
 
     // The last cut, drawn from the camera of a frame or two ago, is the occluder set; the
     // readback is collected when its fence signals so the frame never waits on the GPU
@@ -559,7 +630,7 @@ export default class ClusteredMesh extends THREE.Mesh {
     const occlusionBias = this.occlusionBias
     const floats = this.slotRecordFloats
     const words = this.slotRecords
-    const threshold = this.pixelError
+    const threshold = this.pixelError * this.errorScale
     const detailCap = this.detailCap
     const slotClusters = this.slotClusters
 
@@ -705,6 +776,8 @@ export default class ClusteredMesh extends THREE.Mesh {
     const candidates: Array<{ page: number; priority: number }> = []
     let pending = 0
     for (const [page, priority] of wanted) {
+      // Fetched and decoding or waiting to land: asking again would fetch it twice
+      if (this.landingPages.has(page)) continue
       if (this.scheduler.has(page)) {
         this.scheduler.want(page, priority, this.pass)
         pending++
@@ -713,11 +786,25 @@ export default class ClusteredMesh extends THREE.Mesh {
       }
     }
     const budget = this.availableSlots() - pending
+    this.adjustBudget(candidates.length, pending, budget)
     candidates.sort((a, b) => b.priority - a.priority)
     for (const { page, priority } of candidates.slice(0, Math.max(0, budget))) {
       this.scheduler.want(page, priority, this.pass)
     }
     this.scheduler.endPass(this.pass)
+  }
+
+  // Judged every 600 ms, longer than a page's protection: the scale rises while pages are
+  // wanted, none can be taken and none landed since the last decision, and eases back once
+  // nothing is wanted or in flight and a tenth of the arena is free
+  private adjustBudget(wanted: number, pending: number, budget: number): void {
+    const now = performance.now()
+    if (!this.budget || now - this.lastBudget < 600) return
+    const placed = this.landed - this.landedAtBudget
+    this.landedAtBudget = this.landed
+    this.lastBudget = now
+    if (wanted > Math.max(0, budget) && placed === 0) this.errorScale = Math.min(64, this.errorScale * 1.25)
+    else if (wanted === 0 && pending === 0 && this.errorScale > 1 && this.availableSlots() > this.slotCount * 0.1) this.errorScale = Math.max(1, this.errorScale / 1.1)
   }
 
   //=========================
@@ -794,6 +881,10 @@ if ( theiaDebug > 0.5 ) {
       cullMode: this.cullMode,
       multiDrawExtension: this.multiDrawExtension === true,
       indexRebuilds: this.indexRebuilds,
+      landingQueue: this.landings.length,
+      decoding: this.decoding,
+      decodeWorkers: this.decoder.workerCount,
+      errorScale: this.errorScale,
     }
   }
 
@@ -801,6 +892,9 @@ if ( theiaDebug > 0.5 ) {
   // pool tickets, and takes the shader patch off the material (disposing it if it was made here)
   public dispose(renderer?: THREE.WebGLRenderer): void {
     this.scheduler.dispose()
+    this.landings.length = 0
+    this.landingPages.clear()
+    if (this.ownsDecoder) this.decoder.dispose()
     this.occlusion.dispose(renderer)
     this.geometry.dispose()
     this._matricesTexture.dispose()

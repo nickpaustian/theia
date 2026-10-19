@@ -30,7 +30,7 @@ function render() {
 
 The mesh carries position, normal and uv per vertex, so it textures like any other, with a texture of your own or through Atlas's `attach(mesh)` (without `triangleTint`, which flattens the index buffer). Both modules patch the material through `onBeforeCompile` and each chains whatever patch was there before, so the order does not matter. Call `mesh.dispose(renderer)` to release the arena, index buffers and occlusion target, abort pending fetches and take the shader patch off the material.
 
-`pixelError`, `detailCap`, the culling switches and `debugColour` are public fields and can be changed at any time. `detailCap` holds levels back from the finest (1 halves the triangles): pages below it are neither drawn nor requested while it is set, and finer pages already resident draw again the moment it drops, so it can follow network speed or camera movement where `pixelError` would change the whole cut. Atlas has the same knob.
+`pixelError`, `detailCap`, `landingBudgetMs`, `budget`, the culling switches and `debugColour` are public fields and can be changed at any time. `detailCap` holds levels back from the finest (1 halves the triangles): pages below it are neither drawn nor requested while it is set, and finer pages already resident draw again the moment it drops, so it can follow network speed or camera movement where `pixelError` would change the whole cut. Atlas has the same knob.
 
 ## Options
 
@@ -55,11 +55,16 @@ The mesh carries position, normal and uv per vertex, so it textures like any oth
 | `cullMode` | `"refine"` | what occlusion culling does to a cluster it catches. `"refine"` draws it at the level reached but never descends or requests beneath it; `"hide"` skips it outright (see below) |
 | `drawMode` | `"compact"` | `"compact"` copies the cut's index ranges into one buffer and draws it once. `"ranges"` is experimental: it submits them through `WEBGL_multi_draw` and needs three r164 to r169 |
 | `scheduler.concurrency` | 12 | page fetches in flight at once; ignored when `pool` is set |
-| `scheduler.coalesceGap` | 16384 | queued pages in the same file within this many bytes of each other travel in one request (the gap is fetched too) |
+| `scheduler.coalesceGap` | the build's mean page size | queued pages in the same file within this many bytes of each other travel in one request (the gap is fetched too, which is why the default follows the pages rather than a fixed figure) |
 | `scheduler.maxBatchBytes` | 1 MiB | largest single request |
 | `scheduler.graceMs` | 250 | milliseconds a page may go unwanted before an in-flight fetch is aborted |
 | `scheduler.abortBelow` | 0.5 | fetches past this fraction downloaded are left to finish |
 | `scheduler.cooldownFrames` | 30 | frames before re-requesting a page the arena could not take |
+| `scheduler.valuePerByte` | false | with `pool`: rank pages by priority per byte of the page, so a small page that removes as much error as a large one goes first and a pool shared with Atlas weighs pages against tiles by one measure |
+| `decodeWorkers` | cores − 1, at most 4 | workers that decode pages (meshoptimizer, dequantise, deinterleave) off the main thread; `0` decodes inline. The worker is `pageWorker.js` beside the library, loaded by URL, which bundlers resolve and copy; where it cannot be loaded, pages decode inline |
+| `decoder` | own | a `PageDecoder` to share between meshes; the mesh does not dispose it |
+| `landingBudgetMs` | 3 | milliseconds of main-thread time a frame may spend landing decoded pages into the arena; at least one lands a frame, the rest wait their turn, so a burst of arrivals cannot stall a frame |
+| `budget` | true | when the arena is full and pages are still wanted, raise the error threshold (`errorScale`, a quarter at a time, every 600 ms) until the cut fits, and ease it back as room returns |
 | `pool` | none | a client of a shared fetch pool ([Tethys](https://github.com/nickpaustian/tethys)); the pool then owns the connection budget |
 | `fetch` | global `fetch` | a fetch-shaped function used for the manifest and every page request, so a host can add headers, sign URLs or route through a proxy |
 
@@ -124,7 +129,7 @@ theia preview out/dir [--port 4180] [--no-open] [--error 1.5] [--slots 4096]
 
 ## Stats and debugging
 
-`mesh.stats` reports what is drawn (clusters, triangles, per level), how much culling removed (frustum, backface, occlusion), pages resident and wanted against the slot count, GPU memory, the current `pixelError` and `detailCap`, the draw and cull modes, index rebuilds, and the network counters (queued, in flight, completed, requests, aborted, failures, bytes).
+`mesh.stats` reports what is drawn (clusters, triangles, per level), how much culling removed (frustum, backface, occlusion), pages resident and wanted against the slot count, GPU memory, the current `pixelError`, `detailCap` and `errorScale`, pages decoding and waiting to land (`decoding`, `landingQueue`, `decodeWorkers`), the draw and cull modes, index rebuilds, and the network counters (queued, in flight, completed, requests, aborted, failures, bytes).
 
 - `mesh.debugColour = 1` colours by cluster, `2` by level.
 - `mesh.frozen = true` stops the cut updating so it can be inspected while moving the camera.
@@ -135,7 +140,7 @@ theia preview out/dir [--port 4180] [--no-open] [--error 1.5] [--slots 4096]
 2. **Pages.** A group's member clusters form one page, the unit of streaming: the clusters a group produced all share its error and bounds, so when any of them is too coarse, the whole page beneath is what the renderer needs. Pages are byte ranges inside per-level files and each one is self-describing: a header, one 32-word record per cluster (level, error and bounds, normal cone, index and vertex ranges within the page, the byte range of the page beneath it, a UV centroid and a cluster id), then the vertices and indices. A parent's record is how the page beneath it is found, so nothing is read up front but `manifest.json`, which carries the counts, file list, root pages with their byte ranges and arena sizing. The up-front cost does not grow with the mesh, and one hosted hierarchy can serve several manifests, each choosing its roots and caps.
 3. **Cut** (per frame, `update`). The traversal starts at the root pages and skips clusters whose sphere is outside the view frustum or whose normal cone faces away from the camera. It then tests each remaining cluster's own error projected to pixels at the camera's distance from its sphere. A cluster small enough is drawn. One too coarse hands over to the page beneath it if that page is resident, otherwise it is drawn anyway and the page is requested. Because a page is only reached through a parent that failed exactly the test its clusters would pass, every part of the surface is covered once, and adjacent clusters at different levels share locked boundaries, so there are no cracks. Only the clusters along the cut are visited, so the frame cost follows what is drawn, not the size of the hierarchy.
 4. **Occlusion.** The current cut is rendered into a small packed-depth target, read back through a pixel pack buffer behind a fence so the frame never waits on the GPU, and reduced to the farthest depth per cell. A sphere is held when its nearest point, pulled toward the camera by `occlusionBias` and by the cluster's own error, is behind every cell its screen rectangle touches; any open cell at a silhouette keeps it refining. Because the grid arrives late, spheres are tested from the viewpoint the grid was rendered at.
-5. **Stream.** Pages land in a fixed arena of slots and are evicted least-recently-used once they have been out of the cut for `protectMs`; root pages never are. Requests carry a priority of projected error weighted toward the screen centre, neighbouring pages in the same file are coalesced into one range request, and in-flight requests are aborted once every page in them has gone unwanted past a grace period unless mostly downloaded. Only as many pages as the arena can take are asked for; the rest keep drawing their parents.
+5. **Stream.** Pages land in a fixed arena of slots and are evicted least-recently-used once they have been out of the cut for `protectMs`; root pages never are. Requests carry a priority of projected error weighted toward the screen centre, neighbouring pages in the same file are coalesced into one range request, and in-flight requests are aborted once every page in them has gone unwanted past a grace period unless mostly downloaded. Only as many pages as the arena can take are asked for; the rest keep drawing their parents, and a page already fetched and on its way into the arena is never asked for again. A fetched page is decoded in a worker (meshoptimizer, dequantisation and the split into attribute arrays) and queued; each frame lands as many as its budget allows, in one copy per attribute. When the arena stays full while pages are still wanted, the error threshold is scaled up until the cut fits and eased back as room returns, so a small arena shows a coarser whole rather than a fine cut with holes.
 6. **Draw.** Every slot owns a fixed region of a CPU-side index array, filled when its page lands, so a change of cut never touches vertex data: the traversal writes the cut as a list of index ranges with adjacent clusters of a page merged, those ranges are copied back to back into a growable index buffer only when the cut changes, and the mesh draws like any other through `drawRange`. Two buffers alternate so an upload never waits on the previous draw.
 
 ## Limitations
@@ -143,6 +148,7 @@ theia preview out/dir [--port 4180] [--no-open] [--error 1.5] [--slots 4096]
 - WebGL 2 only. One primitive, one material and one UV set per mesh; no skinning or morph targets.
 - Errors include the attribute terms from the simplifier, so they are conservative.
 - Slots are sized for the largest page while most pages are much smaller, so the arena is over-allocated; a page spanning a run of small fixed slots is the planned fix.
+- Level swaps are instant; a cross-fade between the outgoing and incoming level would need the fade value per cluster carried into the shader.
 - The occlusion test only sees fine clusters: coarse clusters on the far side have spheres too large to sit behind the front surface, so they are refined until their children can be held. A cluster disoccluded at a silhouette appears a frame or two late.
 - A few folded triangles per level can remain from the simplifier.
 - `ranges` draw mode relies on private `BatchedMesh` fields and is slower on ANGLE's Metal backend, where multi-draw is a loop of draw calls. It is experimental.
@@ -152,7 +158,7 @@ theia preview out/dir [--port 4180] [--no-open] [--error 1.5] [--slots 4096]
 
 ```
 npm ci
-npm test            # vitest: the page scheduler against an in-memory host, the builder and inspect on a generated sphere, the runtime loading and refining that build in Node
+npm test            # vitest: the page scheduler against an in-memory host, the builder and inspect on a generated sphere, the runtime loading, refining, landing and budgeting that build in Node (pages decode inline there; Node has no Worker global)
 npm run typecheck
 npm run build       # dist/
 npm run smoke       # headless Chromium through Playwright: the preview on a generated sphere, no failures, no cracks in a mixed cut, no holes on a camera whip

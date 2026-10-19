@@ -22,6 +22,10 @@ export interface PageSchedulerOptions {
   abortBelow?: number
   // Frames to wait before re-requesting a page the arena could not take
   cooldownFrames?: number
+  // With a pool: rank pages by priority per byte of the page rather than by priority alone, so
+  // a small page that removes as much error as a large one goes first and a pool shared with
+  // Atlas can weigh pages against tiles by the same measure
+  valuePerByte?: boolean
 }
 
 export interface PageSchedulerStats {
@@ -67,6 +71,7 @@ export default class PageScheduler {
   private graceMs: number
   private abortBelow: number
   private cooldownFrames: number
+  private valuePerByte: boolean
   private pool: PoolClient | null
   private range: (id: number) => PageRange
   private onLoaded: (id: number, buffer: ArrayBuffer) => void
@@ -96,6 +101,7 @@ export default class PageScheduler {
       graceMs = 250,
       abortBelow = 0.5,
       cooldownFrames = 30,
+      valuePerByte = false,
       coalesceGap = 16384,
       maxBatchBytes = 1 << 20,
       pool = null,
@@ -112,6 +118,7 @@ export default class PageScheduler {
     this.graceMs = graceMs
     this.abortBelow = abortBelow
     this.cooldownFrames = cooldownFrames
+    this.valuePerByte = valuePerByte
   }
 
   public has(id: number): boolean {
@@ -189,7 +196,7 @@ export default class PageScheduler {
     let max = 0
     for (const item of this.queue.values()) max = Math.max(max, item.priority)
     for (const item of this.queue.values()) {
-      const priority = max > 0 ? item.priority / max : 1
+      const priority = this.valuePerByte ? Math.min(item.priority, Number.MAX_VALUE) / Math.max(1, item.range.length) : max > 0 ? item.priority / max : 1
       if (item.ticket) {
         item.ticket.setPriority(priority)
         continue

@@ -34,6 +34,13 @@ try {
 } catch {
   fail("three is not installed next to this package")
 }
+// The page codec imports meshoptimizer's decoder; the page maps the bare specifier to the served copy
+let meshoptDir
+try {
+  meshoptDir = dirname(createRequire(import.meta.url).resolve("meshoptimizer/decoder"))
+} catch {
+  fail("meshoptimizer is not installed next to this package")
+}
 
 const page = `<!doctype html>
 <html>
@@ -51,7 +58,7 @@ const page = `<!doctype html>
     border-radius: 6px; font: 12px ui-monospace, Menlo, monospace; }
 </style>
 <script type="importmap">
-{ "imports": { "three": "/three/build/three.module.js", "three/addons/": "/three/examples/jsm/", "@nickpaustian/theia": "/dist/index.js" } }
+{ "imports": { "three": "/three/build/three.module.js", "three/addons/": "/three/examples/jsm/", "@nickpaustian/theia": "/dist/index.js", "meshoptimizer/decoder": "/meshoptimizer/meshopt_decoder.mjs" } }
 </script>
 </head>
 <body>
@@ -157,6 +164,7 @@ await serve({
     { prefix: "/asset", dir },
     { prefix: "/dist", dir: dist },
     { prefix: "/three", dir: threeDir },
+    { prefix: "/meshoptimizer", dir: meshoptDir },
   ],
   pages: { "/": page },
   port: Number(option("port", 4180)),

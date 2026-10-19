@@ -95,6 +95,48 @@ describe("ClusteredMesh", () => {
     m.dispose()
   })
 
+  it("lands decoded pages a frame at a time within the budget and fetches each page once", async () => {
+    requests.length = 0
+    const m = await ClusteredMesh.load(`file:${dir}/out`, { fetch: fetchFromDisk, occlusionCull: false, backfaceCull: false, pixelError: 1e-4, landingBudgetMs: 0 })
+    const far = camera(6)
+    m.update(far, renderer)
+    // Every page fetched arrives through the queue; a zero budget lands exactly one a frame
+    let queued = 0
+    for (let i = 0; i < 60 && queued === 0; i++) {
+      await new Promise((r) => setTimeout(r, 5))
+      queued = m.stats.landingQueue
+    }
+    expect(queued).toBeGreaterThan(1)
+    m.update(far, renderer)
+    expect(m.stats.landingQueue).toBe(queued - 1)
+    await settled(m, far)
+    expect(m.stats.landingQueue).toBe(0)
+    expect(m.stats.drawnTriangles).toBe(m.manifest.triangles)
+    // Each page was delivered once: the pages resident are the roots plus every delivery
+    expect(m.stats.residentPages).toBe(m.manifest.roots.length + m.stats.network.completed)
+    expect(m.stats.decodeWorkers).toBe(0)
+    m.dispose()
+  })
+
+  it("raises the error scale while a full arena cannot take the pages the cut wants", async () => {
+    const slots = Math.ceil(await ClusteredMesh.load(`file:${dir}/out`, { fetch: fetchFromDisk, occlusionCull: false }).then((m) => { const n = m.manifest.roots.length; m.dispose(); return n })) + 2
+    const m = await ClusteredMesh.load(`file:${dir}/out`, { fetch: fetchFromDisk, occlusionCull: false, backfaceCull: false, pixelError: 1e-4, slots, protectMs: 10_000 })
+    const far = camera(6)
+    for (let round = 0; round < 3; round++) {
+      await settled(m, far)
+      await new Promise((r) => setTimeout(r, 650))
+      m.update(far, renderer)
+    }
+    expect(m.stats.errorScale).toBeGreaterThan(1)
+    expect(m.stats.residentPages).toBeLessThanOrEqual(slots)
+    m.budget = false
+    const held = m.stats.errorScale
+    await new Promise((r) => setTimeout(r, 650))
+    m.update(far, renderer)
+    expect(m.stats.errorScale).toBe(held)
+    m.dispose()
+  })
+
   it("refuses a manifest of another format", async () => {
     const badFetch = async () => new Response(JSON.stringify({ format: 5, recordWords: 32 }), { status: 200 })
     await expect(ClusteredMesh.load("/x", { fetch: badFetch })).rejects.toThrow(/format 5/)
